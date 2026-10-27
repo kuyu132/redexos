@@ -1,0 +1,830 @@
+diff --git a/src/arch/aarch64/device/generic_timer.rs b/src/arch/aarch64/device/generic_timer.rs
+index 08e088d..c04be0f 100644
+--- a/src/arch/aarch64/device/generic_timer.rs
++++ b/src/arch/aarch64/device/generic_timer.rs
+@@ -30,6 +30,15 @@ struct TimerConfig {
+ 
+ static TIMER: Once<TimerConfig> = Once::new();
+ 
++// Keep the architected timer period consistent with scheduler accounting.
++// A hard-coded 100 Hz tick stretches the nominal 6.75 ms preemption interval
++// to 30 ms, starving interactive device/IPC chains on a single CPU.
++fn scheduler_reload_count(clk_freq: u32) -> u32 {
++    ((clk_freq as u128 * context::switch::NANOS_PER_TICK / time::NANOS_PER_SEC)
++        .max(1)) as u32
++}
++
++
+ pub(crate) fn ready() -> bool {
+     TIMER.get().is_some()
+ }
+@@ -74,7 +83,7 @@ pub unsafe fn init(fdt: &Fdt<'_>) {
+     let config = TimerConfig {
+         use_virtual,
+         clk_freq,
+-        reload_count: clk_freq / 100,
++        reload_count: scheduler_reload_count(clk_freq),
+         hwirq: desc.basic.ic_irq,
+         virq: virq as u32,
+     };
+@@ -109,7 +118,7 @@ pub unsafe fn init_acpi(non_secure_physical_gsiv: u32, virtual_gsiv: u32) {
+     } else {
+         non_secure_physical_gsiv
+     };
+-    let reload_count = clk_freq / 100;
++    let reload_count = scheduler_reload_count(clk_freq);
+     if reload_count == 0 {
+         error!("architected timer frequency is too low");
+         return;
+diff --git a/src/arch/aarch64/device/irqchip/gic.rs b/src/arch/aarch64/device/irqchip/gic.rs
+index e6fba21..6d3514b 100644
+--- a/src/arch/aarch64/device/irqchip/gic.rs
++++ b/src/arch/aarch64/device/irqchip/gic.rs
+@@ -246,7 +246,9 @@ impl InterruptController for GenericInterruptController {
+         while i < cnt && (idx + i < 1024) {
+             irq_desc[idx + i].basic.ic_idx = ic_idx;
+             irq_desc[idx + i].basic.ic_irq = i as u32;
+-            irq_desc[idx + i].basic.used = true;
++            // SGIs/PPIs belong to the kernel. SPIs are available to
++            // userspace drivers unless register_irq assigns a kernel handler.
++            irq_desc[idx + i].basic.used = i < 32;
+ 
+             i += 1;
+         }
+diff --git a/src/arch/aarch64/interrupt/exception.rs b/src/arch/aarch64/interrupt/exception.rs
+index 793a619..12a6791 100644
+--- a/src/arch/aarch64/interrupt/exception.rs
++++ b/src/arch/aarch64/interrupt/exception.rs
+@@ -188,14 +188,36 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
+     unsafe {
+         let code = exception_code(stack.iret.esr_el1);
+         match code {
+-            0b010101 => {
+-                let scratch = &stack.scratch;
++            0b111100 | 0b110010 => {
++                let flag = if code == 0b111100 {
++                    syscall::flag::PTRACE_STOP_BREAKPOINT
++                } else {
++                    syscall::flag::PTRACE_STOP_SINGLESTEP
++                };
++                stack.set_singlestep(false);
+                 let mut token = CleanLockToken::new();
+-                let ret = syscall::syscall(
+-                    scratch.x8, scratch.x0, scratch.x1, scratch.x2, scratch.x3, scratch.x4,
+-                    scratch.x5, &mut token,
+-                );
+-                stack.scratch.x0 = ret;
++                if crate::ptrace::breakpoint_callback(flag, None, &mut token).is_none() {
++                    excp_handler(Exception { address: stack.iret.elr_el1, code: usize::from(code) });
++                }
++            }
++            0b010101 => {
++                if stack.scratch.x8 == syscall::AARCH64_SIGRETURN {
++                    let frame_ptr = stack.scratch.x0;
++                    if let Err(error) = syscall::aarch64_sigreturn(stack, frame_ptr) {
++                        stack.scratch.x0 = syscall::error::Error::mux(Err(error));
++                    }
++                } else {
++                    let scratch = &stack.scratch;
++                    let mut token = CleanLockToken::new();
++                    let ret = syscall::syscall(
++                        scratch.x8, scratch.x0, scratch.x1, scratch.x2, scratch.x3, scratch.x4,
++                        scratch.x5, &mut token,
++                    );
++                    stack.scratch.x0 = ret;
++                    // The signal trampoline restores x0 from saved_archdep_reg.
++                    // Save the completed syscall result, never its input argument.
++                    crate::context::signal::signal_handler(&mut token);
++                }
+             }
+ 
+             ty => {
+diff --git a/src/arch/aarch64/interrupt/handler.rs b/src/arch/aarch64/interrupt/handler.rs
+index 641babb..616eef6 100644
+--- a/src/arch/aarch64/interrupt/handler.rs
++++ b/src/arch/aarch64/interrupt/handler.rs
+@@ -273,8 +273,14 @@ impl InterruptStack {
+         }
+     }
+ 
+-    //TODO
+-    pub fn set_singlestep(&mut self, _singlestep: bool) {}
++    pub fn set_singlestep(&mut self, singlestep: bool) {
++        const SS: usize = 1 << 21;
++        if singlestep {
++            self.iret.spsr_el1 = (self.iret.spsr_el1 | SS) & !(1 << 9);
++        } else {
++            self.iret.spsr_el1 &= !SS;
++        }
++    }
+ }
+ 
+ #[macro_export]
+@@ -371,6 +377,19 @@ macro_rules! pop_special {
+         ldp     x14, x15, [sp], 16
+         msr     elr_el1, x15
+         msr     spsr_el1, x14
++        // Software-step enable is CPU-local, whereas SS belongs to this frame.
++        // Set it only on return to the stepped EL0 context, never the tracer
++        // or another process scheduled while the tracee is stopped.
++        mrs     x16, mdscr_el1
++        bic     x16, x16, #1
++        tst     x14, #0xf
++        b.ne    2f
++        tbz     x14, #21, 2f
++        orr     x16, x16, #0x8000
++        orr     x16, x16, #1
++        2:
++        msr     mdscr_el1, x16
++        isb
+     "
+     };
+ }
+diff --git a/src/context/context.rs b/src/context/context.rs
+index f63da92..d3de0be 100644
+--- a/src/context/context.rs
++++ b/src/context/context.rs
+@@ -97,6 +97,7 @@ pub struct Context {
+     pub debug_id: u32,
+     /// Signal handler
+     pub sig: Option<SignalState>,
++    pub debug_session: alloc::sync::Weak<crate::ptrace::Session>,
+     /// Status of context
+     pub status: Status,
+     pub status_reason: &'static str,
+@@ -220,6 +221,7 @@ impl Context {
+         let this = Self {
+             debug_id: DEBUG_ID.fetch_add(1, Ordering::Relaxed),
+             sig: None,
++            debug_session: alloc::sync::Weak::new(),
+             status: Status::HardBlocked {
+                 reason: HardBlockedReason::NotYetStarted,
+             },
+diff --git a/src/context/signal.rs b/src/context/signal.rs
+index 07953e0..173c0b6 100644
+--- a/src/context/signal.rs
++++ b/src/context/signal.rs
+@@ -20,6 +20,15 @@ pub fn signal_handler(token: &mut CleanLockToken) {
+         crate::syscall::process::exit_this_context(None, token);
+     }
+ 
++    // AArch64 signal delivery saves x0, which is also the syscall return
++    // register. Delivering from sched_yield or a timer tick inside a syscall
++    // would save its argument instead of its result. The EL0 SVC handler
++    // retries delivery after writing the result to the userspace frame.
++    #[cfg(target_arch = "aarch64")]
++    if crate::percpu::PercpuBlock::current().inside_syscall.get() {
++        return;
++    }
++
+     /*let thumbs_down = ptrace::breakpoint_callback(
+         PTRACE_STOP_SIGNAL,
+         Some(ptrace_event!(PTRACE_STOP_SIGNAL)),
+diff --git a/src/context/switch.rs b/src/context/switch.rs
+index 84013be..404aeac 100644
+--- a/src/context/switch.rs
++++ b/src/context/switch.rs
+@@ -1186,6 +1186,22 @@ unsafe fn switch_to(
+         }
+     }
+ 
++    // A synchronous scheme call can directly switch to a server without giving
++    // it the scheduler's timeslice. If that server sleeps, select_next_context
++    // only accounts for the donor and would otherwise lose the server's timer.
++    // Register the actual outgoing context; the set also deduplicates timers
++    // already registered for an ordinary scheduled context.
++    if prev_context_guard.status.is_soft_blocked()
++        && let Some(wake) = prev_context_guard.wake
++    {
++        percpu.switch_internals.run_queue.lock().timers.insert((
++            wake,
++            WeakContextRef(Arc::downgrade(ArcContextLockWriteGuard::rwlock(
++                &prev_context_guard,
++            ))),
++        ));
++    }
++
+     // Update context states and prepare for the switch.
+     let prev_context = &mut *prev_context_guard;
+     let next_context = &mut *next_context_guard;
+@@ -1230,17 +1246,11 @@ unsafe fn switch_to(
+             _next_guard: next_context_guard,
+         }));
+ 
+-    /*let (ptrace_session, ptrace_flags) = if let Some((session, bp)) = ptrace::sessions()
+-        .get(&next_context.pid)
+-        .map(|s| (Arc::downgrade(s), s.data.lock().breakpoint))
+-    {
+-        (Some(session), bp.map_or(PtraceFlags::empty(), |f| f.flags))
+-    } else {
+-        (None, PtraceFlags::empty())
+-    };*/
+-    let ptrace_flags = PtraceFlags::empty();
+-
+-    //*percpu.ptrace_session.borrow_mut() = ptrace_session;
++    let debug_session = next_context.debug_session.upgrade();
++    let ptrace_flags = debug_session.as_ref().map_or(PtraceFlags::empty(), |session| {
++        session.data.lock().breakpoint.map_or(PtraceFlags::empty(), |bp| bp.flags)
++    });
++    *percpu.ptrace_session.borrow_mut() = debug_session.as_ref().map(Arc::downgrade);
+     percpu.ptrace_flags.set(ptrace_flags);
+     prev_context.inside_syscall = percpu.inside_syscall.replace(next_context.inside_syscall);
+ 
+diff --git a/src/dtb/irqchip.rs b/src/dtb/irqchip.rs
+index 9d4f657..9b9fa2f 100644
+--- a/src/dtb/irqchip.rs
++++ b/src/dtb/irqchip.rs
+@@ -401,6 +401,7 @@ pub fn register_irq(virq: u32, handler: Box<dyn InterruptHandler>) {
+             return;
+         }
+ 
++        IRQ_CHIP.irq_desc[virq as usize].basic.used = true;
+         IRQ_CHIP.irq_desc[virq as usize].handler = Some(handler);
+     }
+ }
+diff --git a/src/dtb/mod.rs b/src/dtb/mod.rs
+index 419b3ef..de7d5e9 100644
+--- a/src/dtb/mod.rs
++++ b/src/dtb/mod.rs
+@@ -408,48 +408,57 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
+         }
+     }
+ 
+-    if let Some(soc_node) = dt.find_node("/soc") {
+-        if let Some(reg) = soc_node.ranges() {
+-            for chunk in reg {
+-                debug!(
+-                    "dev mem 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}",
+-                    chunk.child_bus_address_hi,
+-                    chunk.child_bus_address,
+-                    chunk.parent_bus_address,
+-                    chunk.size
+-                );
+-
+-                /*TODO: soc memory may contain all free memory!
+-                register_memory_region(
+-                    chunk.parent_bus_address,
+-                    chunk.size,
+-                    BootloaderMemoryKind::Device,
+-                );*/
++    let mut found_soc = false;
++    if let Some(root) = dt.find_node("/") {
++        for soc_node in root.children().filter(|node| is_soc_node_name(node.name)) {
++            found_soc = true;
++            if let Some(reg) = soc_node.ranges() {
++                for chunk in reg {
++                    debug!(
++                        "dev mem 0x{:08x} 0x{:08x} 0x{:08x} 0x{:08x}",
++                        chunk.child_bus_address_hi,
++                        chunk.child_bus_address,
++                        chunk.parent_bus_address,
++                        chunk.size
++                    );
++
++                    /*TODO: soc memory may contain all free memory!
++                    register_memory_region(
++                        chunk.parent_bus_address,
++                        chunk.size,
++                        BootloaderMemoryKind::Device,
++                    );*/
++                }
++            } else {
++                warn!("devicetree {} has no ranges", soc_node.name);
+             }
+-        } else {
+-            warn!("devicetree /soc has no ranges");
+-        }
+ 
+-        // also add direct /soc children because they might not be shown in
+-        // ranges (an identity-mapped bus may have empty ranges)
+-        for device in soc_node.children() {
+-            if let Some(reg) = device.reg() {
+-                for entry in reg {
+-                    if let Some(size) = entry.size {
+-                        let addr = entry.starting_address as usize;
+-                        if let Some(mapped_addr) = get_mmio_address(dt, &device, &entry) {
+-                            debug!(
+-                                "soc device {} 0x{:08x} -> 0x{:08x} size 0x{:08x}",
+-                                device.name, addr, mapped_addr, size
+-                            );
+-                            register_memory_region(mapped_addr, size, BootloaderMemoryKind::Device);
++            // Also add direct SoC children because they might not be shown in
++            // ranges (an identity-mapped bus may have empty ranges).
++            for device in soc_node.children() {
++                if let Some(reg) = device.reg() {
++                    for entry in reg {
++                        if let Some(size) = entry.size {
++                            let addr = entry.starting_address as usize;
++                            if let Some(mapped_addr) = translate_mmio_address(dt, &device, &entry) {
++                                debug!(
++                                    "soc device {} 0x{:08x} -> 0x{:08x} size 0x{:08x}",
++                                    device.name, addr, mapped_addr, size
++                                );
++                                register_memory_region(
++                                    mapped_addr,
++                                    size,
++                                    BootloaderMemoryKind::Device,
++                                );
++                            }
+                         }
+                     }
+                 }
+             }
+         }
+-    } else {
+-        warn!("failed to find /soc in devicetree");
++    }
++    if !found_soc {
++        warn!("failed to find a root SoC bus in devicetree");
+     }
+ 
+     // The selected console may be below a nested bus whose own `reg` range
+@@ -492,6 +501,13 @@ pub fn register_dev_memory_ranges(dt: &Fdt) {
+     }
+ }
+ 
++fn is_soc_node_name(name: &str) -> bool {
++    name == "soc"
++        || name
++            .strip_prefix("soc@")
++            .is_some_and(|unit| !unit.is_empty())
++}
++
+ fn same_node(left: FdtNode<'_, '_>, right: FdtNode<'_, '_>) -> bool {
+     if left.name != right.name {
+         return false;
+@@ -573,24 +589,8 @@ pub fn translate_mmio_address(fdt: &Fdt, device: &FdtNode, region: &MemoryRegion
+ }
+ 
+ // FIXME return PhysicalAddress
+-pub fn get_mmio_address(fdt: &Fdt, _device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
+-    let mut mapped_addr = region.starting_address as usize;
+-    let size = region.size.unwrap_or(0).saturating_sub(1);
+-    let last_address = mapped_addr.saturating_add(size);
+-    if let Some(parent) = fdt.find_node("/soc") {
+-        let mut ranges = parent.ranges().map(|ranges| ranges.peekable())?;
+-        if ranges.peek().is_some() {
+-            let parent_range = ranges.find(|range| {
+-                range.child_bus_address <= mapped_addr
+-                    && last_address - range.child_bus_address <= range.size
+-            })?;
+-            mapped_addr = parent_range
+-                .parent_bus_address
+-                .checked_add(mapped_addr - parent_range.child_bus_address)?;
+-            let _ = mapped_addr.checked_add(size)?;
+-        }
+-    }
+-    Some(mapped_addr)
++pub fn get_mmio_address(fdt: &Fdt, device: &FdtNode, region: &MemoryRegion) -> Option<usize> {
++    translate_mmio_address(fdt, device, region)
+ }
+ 
+ #[cfg_attr(not(dtb), expect(dead_code))]
+@@ -667,7 +667,7 @@ pub fn fill_env_data(dt: &Fdt, env_base: usize) -> usize {
+ #[cfg(test)]
+ mod tests {
+     use super::{
+-        explicit_cell_sizes, translate_mmio_address, visit_address_size_pairs,
++        explicit_cell_sizes, is_soc_node_name, translate_mmio_address, visit_address_size_pairs,
+         visit_fdt_memory_reservations, visit_fixed_reserved_memory_ranges,
+     };
+     use fdt::{
+@@ -706,6 +706,14 @@ mod tests {
+         assert_eq!(translated("/identity-bus/device@3000"), Some(0x3000));
+     }
+ 
++    #[test]
++    fn recognizes_soc_nodes_with_and_without_unit_addresses() {
++        assert!(is_soc_node_name("soc"));
++        assert!(is_soc_node_name("soc@107c000000"));
++        assert!(!is_soc_node_name("soc@"));
++        assert!(!is_soc_node_name("axi"));
++    }
++
+     #[test]
+     fn visits_fdt_and_static_reserved_memory_ranges() {
+         let fdt = Fdt::new(MMIO_DTB).unwrap();
+diff --git a/src/ptrace.rs b/src/ptrace.rs
+index 6cf5940..6d5a9fb 100644
+--- a/src/ptrace.rs
++++ b/src/ptrace.rs
+@@ -25,7 +25,7 @@ use syscall::data::GlobalSchemes;
+ pub struct SessionData {
+     pub(crate) breakpoint: Option<Breakpoint>,
+     events: VecDeque<PtraceEvent>,
+-    file_id: usize,
++    pub(crate) file_ids: alloc::vec::Vec<usize>,
+ }
+ impl SessionData {
+     fn add_event(&mut self, event: PtraceEvent, token: &mut CleanLockToken) {
+@@ -34,7 +34,7 @@ impl SessionData {
+         // Notify nonblocking tracers
+         if self.events.len() == 1 {
+             // If the list of events was previously empty, alert now
+-            proc_trigger_event(self.file_id, EVENT_READ, token);
++            for &id in &self.file_ids { proc_trigger_event(id, EVENT_READ, token); }
+         }
+     }
+ 
+@@ -93,7 +93,7 @@ impl Session {
+             data: Mutex::new(SessionData {
+                 breakpoint: None,
+                 events: VecDeque::new(),
+-                file_id,
++                file_ids: if file_id == 0 { alloc::vec::Vec::new() } else { alloc::vec![file_id] },
+             }),
+             tracee: WaitCondition::new(),
+             tracer: WaitCondition::new(),
+@@ -119,7 +119,7 @@ pub fn close_tracee(session: &Session, token: &mut CleanLockToken) {
+     session.tracer.notify(token);
+ 
+     let data = session.data.lock();
+-    proc_trigger_event(data.file_id, EVENT_READ, token);
++    for &id in &data.file_ids { proc_trigger_event(id, EVENT_READ, token); }
+ }
+ 
+ /// Trigger a notification to the event: scheme
+@@ -179,10 +179,8 @@ pub fn wait(session: Arc<Session>, token: &mut CleanLockToken) -> Result<()> {
+ 
+         // Go to sleep, and drop the lock on our data, which will allow other the
+         // tracer to wake us up.
+-        if session.tracer.wait(data, "ptrace::wait", &mut token) {
+-            // We successfully waited, wake up!
+-            break;
+-        }
++        if session.tracer.wait(data, "ptrace::wait", &mut token) { break; }
++        return Err(Error::new(EINTR));
+     }
+ 
+     Ok(())
+@@ -199,40 +197,28 @@ pub fn breakpoint_callback(
+     event: Option<PtraceEvent>,
+     token: &mut CleanLockToken,
+ ) -> Option<PtraceFlags> {
++    let session = Session::current()?;
++    let mut data = session.data.lock();
++    let breakpoint = data.breakpoint?;
++    if !breakpoint.flags.contains(match_flags) { return None; }
++    data.breakpoint.as_mut()?.reached = true;
++    data.add_event(event.unwrap_or(ptrace_event!(match_flags)), token);
++    drop(data);
++    let owner = crate::context::current().read(token.token()).owner_proc_id;
++    if let Some(owner) = owner {
++        event::trigger(GlobalSchemes::Proc.scheme_id(), owner.get(), EVENT_READ, token);
++    }
++    session.tracer.notify(token);
++    let mut data = session.data.lock();
+     loop {
+-        let percpu = PercpuBlock::current();
+-
+-        // TODO: Some or all flags?
+-        // Only stop if the tracer have asked for this breakpoint
+-        if percpu.ptrace_flags.get().contains(match_flags) {
+-            return None;
+-        }
+-
+-        let session = percpu.ptrace_session.borrow().as_ref()?.upgrade()?;
+-
+-        let mut data = session.data.lock();
+-        let breakpoint = data.breakpoint?; // only go to sleep if there's a breakpoint
+-
+-        // In case no tracer is waiting, make sure the next one gets the memo
+-        data.breakpoint
+-            .as_mut()
+-            .expect("already checked that breakpoint isn't None")
+-            .reached = true;
+-
+-        // Add event to queue
+-        data.add_event(event.unwrap_or(ptrace_event!(match_flags)), token);
+-
+-        // Wake up sleeping tracer
+-        session.tracer.notify(token);
+-        let mut token = token.downgrade();
+-
+-        if session
+-            .tracee
+-            .wait(data, "ptrace::breakpoint_callback", &mut token)
+-        {
+-            // We successfully waited, wake up!
+-            break Some(breakpoint.flags);
++        match data.breakpoint {
++            None => return None,
++            Some(next) if !next.reached => return Some(next.flags),
++            _ => (),
+         }
++        let mut wait_token = token.downgrade();
++        session.tracee.wait_uninterruptible(data, "ptrace::stop", &mut wait_token);
++        data = session.data.lock();
+     }
+ }
+ 
+diff --git a/src/scheme/proc.rs b/src/scheme/proc.rs
+index 2f78687..87b2fae 100644
+--- a/src/scheme/proc.rs
++++ b/src/scheme/proc.rs
+@@ -63,6 +63,7 @@ fn try_stop_context<T>(
+     // Stop process
+     let (prev_status, mut running) = {
+         let mut context = context_ref.write(token.token());
++        if context.status.is_dead() { return Err(Error::new(EOWNERDEAD)); }
+ 
+         (
+             core::mem::replace(
+@@ -104,6 +105,11 @@ fn try_stop_context<T>(
+     ret
+ }
+ 
++#[cfg(target_arch = "aarch64")]
++#[derive(Clone, Copy)]
++#[repr(C)]
++struct DebugRegisters { x: [usize;31], sp: usize, pc: usize, pstate: usize }
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ enum RegsKind {
+     Float,
+@@ -122,6 +128,9 @@ enum ContextHandle {
+     }, // can write ContextVerb
+ 
+     Regs(RegsKind),
++    Trace(Arc<ptrace::Session>),
++    #[cfg(target_arch = "aarch64")]
++    DebugRegs,
+     Sighandler,
+     Start,
+     NewFiletable {
+@@ -198,6 +207,7 @@ fn new_handle(
+     token: &mut CleanLockToken,
+ ) -> Result<(usize, InternalFlags)> {
+     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    if let ContextHandle::Trace(session) = &handle.kind { session.data.lock().file_ids.push(id); }
+     let _ = HANDLES.write(token.token()).insert(id, handle);
+     Ok((id, fl))
+ }
+@@ -246,6 +256,15 @@ impl ProcScheme {
+             "current-filetable" => (ContextHandle::CurrentFiletable, false),
+             "regs/float" => (ContextHandle::Regs(RegsKind::Float), false),
+             "regs/int" => (ContextHandle::Regs(RegsKind::Int), false),
++            #[cfg(target_arch = "aarch64")]
++            "regs/debug" => (ContextHandle::DebugRegs, false),
++            "trace" => {
++                let mut target = context.write(token.token());
++                if target.debug_session.upgrade().is_some() { return Err(Error::new(EBUSY)); }
++                let session = ptrace::Session::new(0);
++                target.debug_session = Arc::downgrade(&session);
++                (ContextHandle::Trace(session), false)
++            },
+             "regs/env" => (ContextHandle::Regs(RegsKind::Env), false),
+             "sighandler" => (ContextHandle::Sighandler, false),
+             "start" => (ContextHandle::Start, false),
+@@ -427,9 +446,12 @@ impl KernelScheme for ProcScheme {
+         _flags: EventFlags,
+         token: &mut CleanLockToken,
+     ) -> Result<EventFlags> {
+-        let handles = HANDLES.read(token.token());
+-        let _handle = handles.get(&id).ok_or(Error::new(EBADF))?;
+-
++        let handle = { let handles = HANDLES.read(token.token()); handles.get(&id).ok_or(Error::new(EBADF))?.clone() };
++        if let ContextHandle::Trace(session) = &handle.kind {
++            let mut flags = session.data.lock().session_fevent_flags();
++            if handle.context.read(token.token()).status.is_dead() { flags |= EVENT_READ; }
++            return Ok(flags);
++        }
+         Ok(EventFlags::empty())
+     }
+ 
+@@ -440,6 +462,21 @@ impl KernelScheme for ProcScheme {
+             .ok_or(Error::new(EBADF))?;
+ 
+         match handle {
++            Handle { context, kind: ContextHandle::Trace(session) } => {
++                let last = {
++                    let mut data = session.data.lock();
++                    data.file_ids.retain(|&number| number != id);
++                    if data.file_ids.is_empty() { data.set_breakpoint(None); true } else { false }
++                };
++                if last && !context.read(token.token()).status.is_dead() {
++                    try_stop_context(context, token, |context, _| {
++                        context.debug_session = Weak::new();
++                        if let Some(regs) = context.regs_mut() { regs.set_singlestep(false); }
++                        Ok(())
++                    })?;
++                    ptrace::close_session(&session, token);
++                }
++            }
+             Handle {
+                 context,
+                 kind:
+@@ -468,10 +505,8 @@ impl KernelScheme for ProcScheme {
+                 {
+                     addrspace.into_drop(token);
+                 }
+-                let _ = ptrace::send_event(
+-                    crate::syscall::ptrace_event!(PTRACE_EVENT_ADDRSPACE_SWITCH, 0),
+-                    token,
+-                );
++                // Stop at the new image entry before it executes in userspace.
++                let _ = ptrace::breakpoint_callback(PTRACE_EVENT_ADDRSPACE_SWITCH, None, token);
+             }
+             Handle {
+                 kind: ContextHandle::AddrSpace { addrspace } | ContextHandle::MmapMinAddr(addrspace),
+@@ -628,7 +663,7 @@ impl KernelScheme for ProcScheme {
+         };
+ 
+         let Handle { context, kind } = handle;
+-        kind.kreadoff(id, context, buf, offset, token)
++        kind.kreadoff(id, context, buf, offset, (_stored_flags as usize & O_NONBLOCK) != 0, token)
+     }
+     fn kcall(
+         &self,
+@@ -963,6 +998,39 @@ impl ContextHandle {
+         token: &mut CleanLockToken,
+     ) -> Result<usize> {
+         match self {
++            ContextHandle::Trace(session) => {
++                let raw = unsafe { buf.read_exact::<u64>()? };
++                let flags = PtraceFlags::from_bits(raw).ok_or(Error::new(EINVAL))?;
++                let supported = PTRACE_STOP_BREAKPOINT | PTRACE_STOP_SINGLESTEP | PTRACE_STOP_EXIT | PTRACE_EVENT_ADDRSPACE_SWITCH;
++                if !supported.contains(flags) { return Err(Error::new(EOPNOTSUPP)); }
++                try_stop_context(context, token, |target, _| {
++                    target.regs_mut().ok_or(Error::new(ENOTRECOVERABLE))?
++                        .set_singlestep(flags.contains(PTRACE_STOP_SINGLESTEP));
++                    Ok(())
++                })?;
++                session.data.lock().set_breakpoint(Some(flags));
++                session.tracee.notify(token);
++                Ok(size_of::<u64>())
++            }
++            #[cfg(target_arch = "aarch64")]
++            ContextHandle::DebugRegs => {
++                let input = unsafe { buf.read_exact::<DebugRegisters>()? };
++                if input.pc >= crate::USER_END_OFFSET || input.sp >= crate::USER_END_OFFSET || input.pc & 3 != 0 {
++                    return Err(Error::new(EINVAL));
++                }
++                try_stop_context(context, token, |target, _| {
++                    let stack = target.regs_mut().ok_or(Error::new(ENOTRECOVERABLE))?;
++                    let mut regs = IntRegisters::default();
++                    let words = (&mut regs as *mut IntRegisters).cast::<usize>();
++                    for i in 0..31 { unsafe { words.add(30-i).write_unaligned(input.x[i]); } }
++                    stack.load(&regs);
++                    stack.iret.sp_el0 = input.sp;
++                    stack.iret.elr_el1 = input.pc;
++                    // A debugger may change NZCV, never the exception level or interrupt masks.
++                    stack.iret.spsr_el1 = (stack.iret.spsr_el1 & !0xf000_0000) | (input.pstate & 0xf000_0000);
++                    Ok(size_of::<DebugRegisters>())
++                })
++            }
+             Self::AddrSpace { addrspace } => {
+                 let mut chunks = buf.usizes();
+                 let mut words_read = 0;
+@@ -1419,9 +1487,37 @@ impl ContextHandle {
+         context: Arc<ContextLock>,
+         buf: UserSliceWo,
+         offset: u64,
++        nonblocking: bool,
+         token: &mut CleanLockToken,
+     ) -> Result<usize> {
+         match self {
++            ContextHandle::Trace(session) => {
++                if buf.len() < size_of::<syscall::PtraceEvent>() { return Err(Error::new(EINVAL)); }
++                loop {
++                    let mut event = [syscall::PtraceEvent::default()];
++                    if session.data.lock().recv_events(&mut event) != 0 {
++                        let bytes = unsafe { slice::from_raw_parts(event.as_ptr().cast::<u8>(), size_of::<syscall::PtraceEvent>()) };
++                        buf.copy_exactly(bytes)?;
++                        return Ok(bytes.len());
++                    }
++                    if context.read(token.token()).status.is_dead() { return Ok(0); }
++                    if nonblocking { return Err(Error::new(EAGAIN)); }
++                    ptrace::wait(Arc::clone(session), token)?;
++                }
++            }
++            #[cfg(target_arch = "aarch64")]
++            ContextHandle::DebugRegs => {
++                let output = try_stop_context(context, token, |target, _| {
++                    let stack = target.regs().ok_or(Error::new(ENOTRECOVERABLE))?;
++                    let mut regs = IntRegisters::default(); stack.save(&mut regs);
++                    let words = (&regs as *const IntRegisters).cast::<usize>();
++                    let mut output = DebugRegisters { x: [0;31], sp: stack.iret.sp_el0, pc: stack.iret.elr_el1, pstate: stack.iret.spsr_el1 & 0xf000_0000 };
++                    for i in 0..31 { output.x[i] = unsafe { words.add(30-i).read_unaligned() }; }
++                    Ok(output)
++                })?;
++                let bytes = unsafe { slice::from_raw_parts((&output as *const DebugRegisters).cast::<u8>(), size_of::<DebugRegisters>()) };
++                buf.copy_common_bytes_from_slice(bytes)
++            }
+             ContextHandle::Regs(kind) => {
+                 union Output {
+                     float: FloatRegisters,
+@@ -1528,6 +1624,7 @@ impl ContextHandle {
+                 let status = {
+                     let context = context.read(token.token());
+                     match context.status {
++                        _ if !context.status.is_dead() && context.debug_session.upgrade().is_some_and(|session| session.data.lock().is_reached()) => ContextStatus::Stopped,
+                         Status::Runnable | Status::Dead { excp: None }
+                             if context.being_sigkilled =>
+                         {
+diff --git a/src/sync/wait_condition.rs b/src/sync/wait_condition.rs
+index 94a6515..e2e349b 100644
+--- a/src/sync/wait_condition.rs
++++ b/src/sync/wait_condition.rs
+@@ -69,6 +69,20 @@ impl WaitCondition {
+         guard: T,
+         reason: &'static str,
+         token: &'a mut LockToken<'a, L2>,
++    ) -> bool {
++        self.wait_inner_mode(guard, reason, token, true)
++    }
++
++    /// A ptrace stop stays blocked while ordinary userspace signals are pending.
++    pub fn wait_uninterruptible<'a, T>(
++        &self, guard: T, reason: &'static str, token: &'a mut LockToken<'a, L1>,
++    ) -> bool {
++        let mut token = token.downgrade();
++        self.wait_inner_mode(guard, reason, &mut token, false)
++    }
++
++    fn wait_inner_mode<'a, T>(
++        &self, guard: T, reason: &'static str, token: &'a mut LockToken<'a, L2>, interruptible: bool,
+     ) -> bool {
+         let current_context_ptr = {
+             let current_context_ref = context::current();
+@@ -80,7 +94,7 @@ impl WaitCondition {
+             let mut token = token.token();
+             {
+                 let context = current_context_ref.upgradeable_read(token.token());
+-                if let Some((control, pctl, _)) = context.sigcontrol()
++                if interruptible && let Some((control, pctl, _)) = context.sigcontrol()
+                     && control.currently_pending_unblocked(pctl) != 0
+                 {
+                     return false;
+diff --git a/src/syscall/mod.rs b/src/syscall/mod.rs
+index 6d02d9b..832659e 100644
+--- a/src/syscall/mod.rs
++++ b/src/syscall/mod.rs
+@@ -49,6 +49,43 @@ pub mod time;
+ /// Safely copying memory between user and kernel memory
+ pub mod usercopy;
+ 
++#[cfg(target_arch = "aarch64")]
++pub const AARCH64_SIGRETURN: usize = 139;
++
++#[cfg(target_arch = "aarch64")]
++pub fn aarch64_sigreturn(
++    stack: &mut crate::arch::aarch64::interrupt::InterruptStack,
++    frame_ptr: usize,
++) -> Result<()> {
++    // Matches redox-rt's ArchIntRegs: x30..x1, SP, NZCV, PC, x0.
++    let frame = unsafe {
++        UserSlice::ro(frame_ptr, 34 * size_of::<usize>())?.read_exact::<[usize; 34]>()?
++    };
++    let sp = frame[30];
++    let pc = frame[32];
++    if pc >= crate::USER_END_OFFSET
++        || sp >= crate::USER_END_OFFSET
++        || pc & 3 != 0
++        || sp & 15 != 0
++    {
++        return Err(Error::new(EINVAL));
++    }
++
++    let mut regs = IntRegisters::default();
++    let words = (&mut regs as *mut IntRegisters).cast::<usize>();
++    for (index, value) in frame[..30].iter().copied().enumerate() {
++        unsafe { words.add(index).write_unaligned(value) };
++    }
++    unsafe { words.add(30).write_unaligned(frame[33]) };
++    stack.load(&regs);
++    stack.iret.sp_el0 = sp;
++    stack.iret.elr_el1 = pc;
++    // Restore condition flags only; retain EL0 mode and interrupt/debug masks.
++    stack.iret.spsr_el1 =
++        (stack.iret.spsr_el1 & !0xf000_0000) | (frame[31] & 0xf000_0000);
++    Ok(())
++}
++
+ /// This function is the syscall handler of the kernel, it is composed of an inner function that returns a `Result<usize>`. After the inner function runs, the syscall
+ /// function calls [`Error::mux`] on it.
+ #[must_use]
+diff --git a/src/syscall/process.rs b/src/syscall/process.rs
+index 1db548e..14e2b96 100644
+--- a/src/syscall/process.rs
++++ b/src/syscall/process.rs
+@@ -60,6 +60,7 @@ pub fn exit_this_context(excp: Option<syscall::Exception>, token: &mut CleanLock
+ 
+         guard.owner_proc_id
+     };
++    let debug_session = context_lock.read(token.token()).debug_session.upgrade();
+     if let Some(owner) = owner {
+         event::trigger(
+             GlobalSchemes::Proc.scheme_id(),
+@@ -79,6 +80,11 @@ pub fn exit_this_context(excp: Option<syscall::Exception>, token: &mut CleanLock
+         drop(context_ref);
+     }
+     drop(close_files);
++    // Publish the owner's death event and finish removing the context before
++    // waking a tracer that may immediately ask procmgr to reap the child.
++    if let Some(session) = debug_session {
++        crate::ptrace::close_tracee(&session, token);
++    }
+     context::switch(token);
+     unreachable!();
+ }

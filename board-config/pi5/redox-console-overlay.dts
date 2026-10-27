@@ -1,0 +1,13 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "raspberrypi,5-model-b";
+
+    fragment@0 {
+        target-path = "/chosen";
+        __overlay__ {
+            stdout-path = "serial10:115200n8";
+        };
+    };
+};

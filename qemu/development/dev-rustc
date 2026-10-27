@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Native Redox compiler; use the matching patched libc SDK and bundled LLD.
+set -euo pipefail
+sysroot=$(rustc --print sysroot)
+linker="$sysroot/lib/rustlib/aarch64-unknown-redox/bin/rust-lld"
+exec rustc -C linker="$linker" -C linker-flavor=ld.lld \
+    -C panic=abort -C target-feature=+crt-static -C relocation-model=static \
+    -C force-frame-pointers=yes -C debuginfo=2 -C opt-level=0 \
+    -L native=/usr/lib/devkit -C link-arg=/usr/lib/devkit/crt0.o \
+    -C link-arg=-T/usr/lib/devkit/arrays.ld \
+    -C link-arg=--no-mmap-output-file -C link-arg=--export-dynamic -C link-arg=-Ttext=0x50000000 "$@"

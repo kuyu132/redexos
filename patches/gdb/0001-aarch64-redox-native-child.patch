@@ -1,0 +1,236 @@
+diff --git a/gdb/aarch64-redox-nat.c b/gdb/aarch64-redox-nat.c
+new file mode 100644
+index 00000000..04c4c5cd
+--- /dev/null
++++ b/gdb/aarch64-redox-nat.c
+@@ -0,0 +1,66 @@
++/* Native AArch64 Redox child target. SPDX-License-Identifier: GPL-3.0-or-later */
++#include "defs.h"
++#include "inferior.h"
++#include "regcache.h"
++#include "target.h"
++#include "gdbsupport/common-inferior.h"
++#include "inf-ptrace.h"
++#include "aarch64-tdep.h"
++#include "arch/aarch64.h"
++#include <sys/ptrace.h>
++#include <sys/user.h>
++
++class aarch64_redox_nat_target final : public inf_ptrace_target
++{
++public:
++  void fetch_registers (regcache *cache, int regnum) override;
++  void store_registers (regcache *cache, int regnum) override;
++  const target_desc *read_description () override
++  { return aarch64_read_description (aarch64_features {}); }
++protected:
++  void post_startup_inferior (ptid_t) override {}
++};
++
++static aarch64_redox_nat_target redox_target;
++
++void aarch64_redox_nat_target::fetch_registers (regcache *cache, int regnum)
++{
++  user_regs_struct regs;
++  if (ptrace (PTRACE_GETREGS, cache->ptid ().pid (), (void *) 0, &regs) < 0)
++    perror_with_name ("ptrace GETREGS");
++  for (int i = 0; i < gdbarch_num_regs (cache->arch ()); ++i)
++    if (regnum == -1 || regnum == i)
++      {
++        if (i < 31) cache->raw_supply (i, &regs.regs[i]);
++        else if (i == 31) cache->raw_supply (i, &regs.sp);
++        else if (i == 32) cache->raw_supply (i, &regs.pc);
++        else if (i == 33) cache->raw_supply (i, &regs.pstate);
++        else cache->raw_supply (i, nullptr); // SIMD regsets are not implemented yet.
++      }
++}
++
++void aarch64_redox_nat_target::store_registers (regcache *cache, int regnum)
++{
++  if (regnum >= 34) error ("Redox SIMD register writes are not implemented");
++  user_regs_struct regs;
++  if (ptrace (PTRACE_GETREGS, cache->ptid ().pid (), (void *) 0, &regs) < 0)
++    perror_with_name ("ptrace GETREGS");
++  for (int i = 0; i < 34; ++i)
++    if (regnum == -1 || regnum == i)
++      {
++        if (i < 31) cache->raw_collect (i, &regs.regs[i]);
++        else if (i == 31) cache->raw_collect (i, &regs.sp);
++        else if (i == 32) cache->raw_collect (i, &regs.pc);
++        else cache->raw_collect (i, &regs.pstate);
++      }
++  if (ptrace (PTRACE_SETREGS, cache->ptid ().pid (), (void *) 0, &regs) < 0)
++    perror_with_name ("ptrace SETREGS");
++}
++
++void _initialize_aarch64_redox_nat ();
++void
++_initialize_aarch64_redox_nat ()
++{
++  startup_with_shell = false;
++  add_inf_child_target (&redox_target);
++}
+diff --git a/gdb/configure.host b/gdb/configure.host
+index da71675b..53387531 100644
+--- a/gdb/configure.host
++++ b/gdb/configure.host
+@@ -79,6 +79,7 @@ case "${host}" in
+ 
+ *-*-darwin*)		gdb_host=darwin ;;
+ 
++aarch64*-*-redox*)	gdb_host=redox ;;
+ aarch64*-*-linux*)	gdb_host=linux ;;
+ aarch64*-*-freebsd*)	gdb_host=fbsd ;;
+ 
+diff --git a/gdb/configure.nat b/gdb/configure.nat
+index f88c9c2f..26acf4eb 100644
+--- a/gdb/configure.nat
++++ b/gdb/configure.nat
+@@ -52,6 +52,9 @@
+ # This first case is useful for filling default values for each
+ # gdb_host.
+ case ${gdb_host} in
++    redox)
++        NATDEPFILES='fork-child.o nat/fork-inferior.o inf-ptrace.o aarch64-redox-nat.o'
++        ;;
+     *linux*)
+ 	NAT_FILE='config/nm-linux.h'
+ 	NATDEPFILES='inf-ptrace.o fork-child.o nat/fork-inferior.o \
+diff --git a/gdb/configure.tgt b/gdb/configure.tgt
+index 0838c77d..8108eb4c 100644
+--- a/gdb/configure.tgt
++++ b/gdb/configure.tgt
+@@ -746,6 +746,9 @@ x86_64-*-openbsd*)
+ 			i386-bsd-tdep.o i386-obsd-tdep.o \
+ 			bsd-uthread.o"
+ 	;;
++aarch64-*-redox*)
++	build_gdbserver=no
++	;;
+ x86_64-*-redox*)
+ 	# Target: Redox x86-64
+ 	gdb_target_obs="${amd64_tobjs}"
+diff --git a/gdb/inf-ptrace.c b/gdb/inf-ptrace.c
+index acb80af9..dc4fe7ff 100644
+--- a/gdb/inf-ptrace.c
++++ b/gdb/inf-ptrace.c
+@@ -63,7 +63,26 @@ inf_ptrace_me (void)
+   /* "Trace me, Dr. Memory!"  */
+   if (ptrace (PT_TRACE_ME, 0, (PTRACE_TYPE_ARG3) 0, 0) < 0)
+     trace_start_error_with_name ("ptrace");
++#ifdef __redox__
++  raise (SIGSTOP);
++#endif
++}
++
++#ifdef __redox__
++/* Child capabilities are issued by procmgr after the initial child stop. */
++static void
++redox_init_trace (int pid)
++{
++  int status;
++  if (waitpid (pid, &status, WUNTRACED) != pid)
++    perror_with_name ("initial child stop");
++  if (!WIFSTOPPED (status))
++    error ("Child exited before initial child stop (wait status %#x).", status);
++  if (ptrace (PTRACE_ATTACH, pid, (void *) 0, (void *) 0) < 0
++      || ptrace (PTRACE_CONT, pid, (void *) 0, (void *) 0) < 0)
++    perror_with_name ("attach child trace capability");
+ }
++#endif
+ 
+ /* Start a new inferior Unix child process.  EXEC_FILE is the file to
+    run, ALLARGS is a string containing the arguments to the program.
+@@ -92,8 +111,17 @@ inf_ptrace_target::create_inferior (const char *exec_file,
+       unpusher.reset (this);
+     }
+ 
+-  pid_t pid = fork_inferior (exec_file, allargs, env, inf_ptrace_me, NULL,
+-			     NULL, NULL, NULL);
++#ifdef __redox__
++  try
++    {
++#endif
++  pid_t pid = fork_inferior (exec_file, allargs, env, inf_ptrace_me,
++#ifdef __redox__
++                             redox_init_trace,
++#else
++                             NULL,
++#endif
++                             NULL, NULL, NULL);
+ 
+   ptid_t ptid (pid);
+   /* We have something that executes now.  We'll be running through
+@@ -109,6 +137,24 @@ inf_ptrace_target::create_inferior (const char *exec_file,
+   /* On some targets, there must be some explicit actions taken after
+      the inferior has been started up.  */
+   post_startup_inferior (ptid);
++#ifdef __redox__
++    }
++  catch (const gdb_exception_error &)
++    {
++      // fork_inferior may throw after postfork_hook recorded the PID but
++      // before returning it. Retire that inferior before unpushing its
++      // target, so run's resume guard cannot dereference a missing target.
++      if (inf->pid > 0)
++        {
++          int status;
++          ::kill (inf->pid, SIGKILL);
++          while (waitpid (inf->pid, &status, 0) < 0 && errno == EINTR)
++            ;
++          exit_inferior (inf);
++        }
++      throw;
++    }
++#endif
+ }
+ 
+ /* Clean up a rotting corpse of an inferior after it died.  */
+diff --git a/gdbsupport/enum-flags.h b/gdbsupport/enum-flags.h
+index 50780043..2f8bf81b 100644
+--- a/gdbsupport/enum-flags.h
++++ b/gdbsupport/enum-flags.h
+@@ -88,13 +88,19 @@ template<> struct integer_for_size<2, 1> { typedef int16_t type; };
+ template<> struct integer_for_size<4, 1> { typedef int32_t type; };
+ template<> struct integer_for_size<8, 1> { typedef int64_t type; };
+ 
++/* Use integral promotion without creating an out-of-range enum constant. */
++template<typename T, bool = std::is_convertible<T, int>::value>
++struct enum_promoted_type { using type = typename std::underlying_type<T>::type; };
++template<typename T>
++struct enum_promoted_type<T, true> { using type = decltype (+T {}); };
++
+ template<typename T>
+ struct enum_underlying_type
+ {
+   DIAGNOSTIC_PUSH
+   DIAGNOSTIC_IGNORE_ENUM_CONSTEXPR_CONVERSION
+   typedef typename
+-    integer_for_size<sizeof (T), static_cast<bool>(T (-1) < T (0))>::type
++    integer_for_size<sizeof (T), std::is_signed<typename std::conditional<(sizeof (T) < sizeof (int)), typename std::underlying_type<T>::type, typename enum_promoted_type<T>::type>::type>::value>::type
+     type;
+   DIAGNOSTIC_POP
+ };
+diff --git a/include/getopt.h b/include/getopt.h
+index cc69df7a..14f8c99f 100644
+--- a/include/getopt.h
++++ b/include/getopt.h
+@@ -19,6 +19,18 @@
+    Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA 02110-1301,
+    USA.  */
+ 
++/* Relibc exports getopt in shared Rust codegen objects; keep this copy private. */
++#ifdef __redox__
++#define getopt redox_gdb_getopt
++#define getopt_long redox_gdb_getopt_long
++#define getopt_long_only redox_gdb_getopt_long_only
++#define optarg redox_gdb_optarg
++#define optind redox_gdb_optind
++#define opterr redox_gdb_opterr
++#define optopt redox_gdb_optopt
++#define _getopt_internal redox_gdb_getopt_internal
++#endif
++
+ #ifndef _GETOPT_H
+ #define _GETOPT_H 1
+ 

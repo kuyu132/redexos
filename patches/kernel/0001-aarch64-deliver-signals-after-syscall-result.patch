@@ -1,0 +1,34 @@
+diff --git a/src/arch/aarch64/interrupt/exception.rs b/src/arch/aarch64/interrupt/exception.rs
+index 793a619..2b8feca 100644
+--- a/src/arch/aarch64/interrupt/exception.rs
++++ b/src/arch/aarch64/interrupt/exception.rs
+@@ -196,6 +196,9 @@ exception_stack!(synchronous_exception_at_el0, |stack| {
+                     scratch.x5, &mut token,
+                 );
+                 stack.scratch.x0 = ret;
++                // The signal trampoline restores x0 from saved_archdep_reg.
++                // Save the completed syscall result, never its input argument.
++                crate::context::signal::signal_handler(&mut token);
+             }
+ 
+             ty => {
+diff --git a/src/context/signal.rs b/src/context/signal.rs
+index 07953e0..173c0b6 100644
+--- a/src/context/signal.rs
++++ b/src/context/signal.rs
+@@ -20,6 +20,15 @@ pub fn signal_handler(token: &mut CleanLockToken) {
+         crate::syscall::process::exit_this_context(None, token);
+     }
+ 
++    // AArch64 signal delivery saves x0, which is also the syscall return
++    // register. Delivering from sched_yield or a timer tick inside a syscall
++    // would save its argument instead of its result. The EL0 SVC handler
++    // retries delivery after writing the result to the userspace frame.
++    #[cfg(target_arch = "aarch64")]
++    if crate::percpu::PercpuBlock::current().inside_syscall.get() {
++        return;
++    }
++
+     /*let thumbs_down = ptrace::breakpoint_callback(
+         PTRACE_STOP_SIGNAL,
+         Some(ptrace_event!(PTRACE_STOP_SIGNAL)),

@@ -1,0 +1,26 @@
+{
+  "recorded_date": "2026-10-23",
+  "target": "aarch64-unknown-redox",
+  "packages": [
+    "rust",
+    "gnu-make"
+  ],
+  "note": "Installation observation, not a repository lock. Official pkg installed rust, llvm21 and gnu-make; signed installed package headers are retained in artifacts/qemu-development/20261023T132723Z. Repository contents can change.",
+  "versions": {
+    "rustc": "1.98.0-dev",
+    "cargo": "1.98.0-dev (8b241a6b6 2026-06-01)",
+    "rustfmt": "1.9.0-dev (c879a53564 2026-07-14)",
+    "make": "GNU Make 4.4"
+  },
+  "repository": "https://static.redox-os.org/pkg/aarch64-unknown-redox/",
+  "native_executable_sha256": {
+    "/usr/bin/rustc": "14c74890a4bb506c33e00889b45898ba7b3df7b5616d4cd47b25357a6e9c6a22",
+    "/usr/bin/cargo": "9112fcac668bcb88101974483cad05bfe9405bd9c056eacb1eaf36b6ac8ee615",
+    "/usr/bin/make": "ecfc91af3ab62b22854f8238480a1e2e87d82c17945b403f07b43b05524fa80a"
+  },
+  "installed_package_headers_sha256": {
+    "rust": "c1336f742ead936e4bbccc888c7d9d765a6f3c61cdeb2a8ce9cb05f16c8f3fd9",
+    "gnu-make": "1200119abbbc220dc6718344d5f52cd50be3b4db1e2c59ecdb63c00442f7b8c1",
+    "llvm21": "9d4b10026772058d5425cb1edc553d7d07fac7ec5be80b07236f54f5f12f5201"
+  }
+}

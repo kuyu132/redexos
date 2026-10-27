@@ -1,0 +1,38 @@
+diff --git a/drivers/input/usbhidd/src/main.rs b/drivers/input/usbhidd/src/main.rs
+index 7aaf479..fd7e3a3 100644
+--- a/drivers/input/usbhidd/src/main.rs
++++ b/drivers/input/usbhidd/src/main.rs
+@@ -320,9 +320,10 @@ fn main() -> Result<()> {
+ 
+     //TODO: do we need to set protocol to report? It fails for mice.
+ 
+-    //TODO: dynamically create good values, fix xhcid so it does not block on each request
+-    // This sets all reports to a duration of 4ms
+-    if let Err(err) = reqs::set_idle(&handle, 1, 0, interface_num as u16) {
++    // Report state changes; do not generate unchanged reports every 4 ms.
++    // QEMU gives keyboard and pointer separate controllers because xhcid's
++    // current scheme handler serializes blocking endpoint reads.
++    if let Err(err) = reqs::set_idle(&handle, 0, 0, interface_num as u16) {
+         log::warn!("failed to set idle: {}", err);
+     }
+ 
+@@ -425,11 +426,14 @@ fn main() -> Result<()> {
+     let mut last_buttons = [false, false, false];
+     let mut gamepad_state = HashMap::new();
+     loop {
+-        //TODO: get frequency from device
+-        //TODO: use sleeps when accuracy is better: thread::sleep(time::Duration::from_millis(10));
+-        let timer = time::Instant::now();
+-        while timer.elapsed() < time::Duration::from_millis(1) {
+-            thread::yield_now();
++        // Interrupt reads already block until the endpoint has a report.
++        // An extra yield loop delays draining queued key releases under TCG.
++        // Only control-transfer fallback needs software polling throttling.
++        if endpoint_opt.is_none() {
++            let timer = time::Instant::now();
++            while timer.elapsed() < time::Duration::from_millis(1) {
++                thread::yield_now();
++            }
+         }
+ 
+         if let Some(endpoint) = &mut endpoint_opt {

@@ -1,0 +1,6 @@
+# Redox Pi 4B early-boot contract. The firmware/UEFI bundle must retain these.
+arm_64bit=1
+enable_uart=1
+# The stock DTB maps serial0 to the unsupported mini UART. This overlay swaps
+# serial0 to the PL011 on GPIO14/15 and moves Bluetooth to the mini UART.
+dtoverlay=disable-bt

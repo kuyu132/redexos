@@ -1,0 +1,5 @@
+include = ["../pi-port-common.toml"]
+
+[[files]]
+path = "/etc/port-target"
+data = "pi4b: experimental, hardware not validated\n"

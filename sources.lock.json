@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "recorded_date": "2026-10-25",
+  "rust_toolchain": "nightly-2026-05-24",
+  "scope": "Build system and six core repositories; locally verified ARM64 fixes are checksum-locked into core recipes; remaining packages are not fully locked",
+  "repositories": {
+    "redox": {
+      "url": "https://github.com/redox-os/redox.git",
+      "rev": "b3f371c1bac6bb4c88ef4eb4b30139d2e007580f"
+    },
+    "kernel": {
+      "url": "https://gitlab.redox-os.org/redox-os/kernel.git",
+      "rev": "72fcb44fa88c3a74ec9efaaba9082cb2e141caa1",
+      "patch": {
+        "path": "patches/kernel/0004-aarch64-native-ptrace.patch",
+        "sha256": "8ed8d63a05c7def5a4e54fbfbc5c2730a7b68d702ae77192ea79bf8978fa20c7"
+      }
+    },
+    "bootloader": {
+      "url": "https://github.com/redox-os/bootloader.git",
+      "rev": "cc922ec0bb3f9dd31cce589bb513ab2f15ac9746",
+      "patch": {
+        "path": "patches/bootloader/0005-isolation-probes.patch",
+        "sha256": "6f3b4702d6531c1370b37eb6f63c1c35ae5f7dedb27ab0233fa36b8e32b3712f"
+      }
+    },
+    "base": {
+      "url": "https://gitlab.redox-os.org/redox-os/base.git",
+      "rev": "06bd7b3ffb16c547f9cc545d16d39b325e3f67d4",
+      "patch": {
+        "path": "patches/base/0003-desktop-and-debug-child-capabilities.patch",
+        "sha256": "12769a7a5b36d53bbfb755d9400ecf92a1bcc51adb41d1032ed9dfe7ab5dd76e"
+      }
+    },
+    "relibc": {
+      "url": "https://gitlab.redox-os.org/redox-os/relibc.git",
+      "rev": "39e84406c8a42acbc4f4be002e04b8bbd704a335",
+      "patch": {
+        "path": "patches/relibc/0003-aarch64-native-ptrace.patch",
+        "sha256": "6a87077e8f89ab348498e234f3d8a09edcbcb61ac379974d452a19a8b23101c1"
+      }
+    },
+    "installer": {
+      "url": "https://gitlab.redox-os.org/redox-os/installer.git",
+      "rev": "2d2416c151e880bd68799b5c6cf46d019d964675"
+    },
+    "redoxfs": {
+      "url": "https://gitlab.redox-os.org/redox-os/redoxfs.git",
+      "rev": "b87b0976ee122036b2ec040159b890e1e06ca139",
+      "patch": {
+        "path": "patches/redoxfs/0001-release-closed-mapping-cache.patch",
+        "sha256": "cb1e38764603a8f50056056270dff82be0a5d06e40db7c080517201baa8c5447"
+      }
+    }
+  },
+  "device_tree_reference": {
+    "url": "https://github.com/raspberrypi/linux.git",
+    "rev": "7bc8e3ebb16d7287ad155d8d33c01c04dda1ee3d",
+    "branch": "rpi-6.18.y",
+    "role": "source reference, not the firmware-delivered DTB"
+  },
+  "firmware_device_tree": {
+    "url": "https://github.com/raspberrypi/firmware.git",
+    "rev": "88a0ae8876e800801ee5c27624138b3d02a21c63",
+    "raw_base": "https://raw.githubusercontent.com/raspberrypi/firmware/88a0ae8876e800801ee5c27624138b3d02a21c63/boot",
+    "files": {
+      "bcm2711-rpi-4-b.dtb": "75761b73c284e26623e4d1624bff13e67bce2ae620880efd81d6571a3739fcfb",
+      "bcm2712-rpi-5-b.dtb": "03ce4742452ad52e3e8ec2259a0c705b496970e2b75e6e0b4e5446475ea1b926",
+      "overlays/disable-bt.dtbo": "ea69d22dedc607fee75eec57d8a4cc0f0eab93cd75393e61a64c49fbac912d02"
+    },
+    "role": "Firmware-delivered DTB reference used for offline early-boot contract checks; the board EEPROM may still mutate the handoff DTB"
+  },
+  "unresolved": [
+    "board firmware and EEPROM",
+    "U-Boot/UEFI per board",
+    "actual firmware-mutated handoff DTB",
+    "remaining recipe sources",
+    "binary prefix archive and container digest"
+  ]
+}

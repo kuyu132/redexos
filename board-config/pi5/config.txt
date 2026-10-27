@@ -1,0 +1,4 @@
+# Redox Pi 5 early-boot contract for the dedicated UART10 debug connector.
+arm_64bit=1
+enable_uart=1
+# UART10 is on BCM2712. Do not substitute RP1 UART0 for early kernel logging.

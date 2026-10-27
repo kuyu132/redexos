@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "recorded_date": "2026-10-22",
+  "rust_toolchain": "nightly-2026-05-24",
+  "repositories": {
+    "kernel": {
+      "url": "https://gitlab.redox-os.org/redox-os/kernel.git",
+      "rev": "72fcb44fa88c3a74ec9efaaba9082cb2e141caa1",
+      "patch": {
+        "path": "patches/kernel/0004-aarch64-native-ptrace.patch",
+        "sha256": "8ed8d63a05c7def5a4e54fbfbc5c2730a7b68d702ae77192ea79bf8978fa20c7"
+      }
+    },
+    "bootloader": {
+      "url": "https://github.com/redox-os/bootloader.git",
+      "rev": "cc922ec0bb3f9dd31cce589bb513ab2f15ac9746",
+      "patch": {
+        "path": "patches/bootloader/0005-isolation-probes.patch",
+        "sha256": "6f3b4702d6531c1370b37eb6f63c1c35ae5f7dedb27ab0233fa36b8e32b3712f"
+      }
+    }
+  },
+  "userspace_image": {
+    "url": "https://static.redox-os.org/img/aarch64/redox_server_aarch64_2026-10-21_562_livedisk.iso.zst",
+    "sha256": "4365d710d1b53d3b4a68f315173706d5997d46abd2b256eb28a839559c30d1d8",
+    "upstream_checksums_url": "https://static.redox-os.org/img/aarch64/SHA256SUM",
+    "role": "prebuilt official userspace/initfs; replace kernel with local compilation"
+  },
+  "desktop_image": {
+    "url": "https://static.redox-os.org/img/aarch64/redox_desktop_aarch64_2026-10-21_562_livedisk.iso.zst",
+    "sha256": "0afc9689ed303096c77bd66f8ae8695c189e7e3ee53af459eaa33bf225f174b3",
+    "upstream_checksums_url": "https://static.redox-os.org/img/aarch64/SHA256SUM",
+    "role": "prebuilt official desktop userspace/initfs; replace kernel with local compilation"
+  },
+  "redoxfs": {
+    "url": "https://gitlab.redox-os.org/redox-os/redoxfs.git",
+    "rev": "b87b0976ee122036b2ec040159b890e1e06ca139",
+    "patch": {
+      "path": "patches/redoxfs/0001-release-closed-mapping-cache.patch",
+      "sha256": "cb1e38764603a8f50056056270dff82be0a5d06e40db7c080517201baa8c5447"
+    }
+  },
+  "selection_note": "Kernel mainline commit preceding the official image build timestamp; compatibility must be verified by boot, not inferred from date alone.",
+  "relibc": {
+    "url": "https://gitlab.redox-os.org/redox-os/relibc.git",
+    "rev": "39e84406c8a42acbc4f4be002e04b8bbd704a335",
+    "patch": {
+      "path": "patches/relibc/0003-aarch64-native-ptrace.patch",
+      "sha256": "6a87077e8f89ab348498e234f3d8a09edcbcb61ac379974d452a19a8b23101c1"
+    },
+    "submodules": {
+      "dlmalloc-rs": "40c10f6182cb1d2a78b29f85492936dfbeded02e"
+    },
+    "features": [
+      "math_libm"
+    ]
+  },
+  "base": {
+    "url": "https://gitlab.redox-os.org/redox-os/base.git",
+    "rev": "06bd7b3ffb16c547f9cc545d16d39b325e3f67d4",
+    "patch": {
+      "path": "patches/base/0003-desktop-and-debug-child-capabilities.patch",
+      "sha256": "12769a7a5b36d53bbfb755d9400ecf92a1bcc51adb41d1032ed9dfe7ab5dd76e"
+    }
+  },
+  "gcc_unwind": {
+    "url": "https://static.redox-os.org/toolchain/x86_64-unknown-linux-gnu/aarch64-unknown-redox/gcc-install.tar.gz",
+    "sha256": "c6fdbc3c72e065acd6d5b9ae45228d236b8e2bfe7c7c866919e40bba7a11a1e7",
+    "member": "./lib/gcc/aarch64-unknown-redox/13.2.0/libgcc_eh.a",
+    "member_sha256": "8f513ed041d93121d26c547d6627eeeaf7ddb481746134556b560a1854c73586"
+  },
+  "native_gdb": {
+    "url": "https://gitlab.redox-os.org/redox-os/binutils-gdb.git",
+    "rev": "6b9878dc383725297a3ce162f70337c97a457ceb",
+    "branch": "redox-2.43.1",
+    "patch": {
+      "path": "patches/gdb/0001-aarch64-redox-native-child.patch",
+      "sha256": "db0d85bf082771dff3682a4a800042f9069f356b94b18834db078958d9e834ef"
+    },
+    "gmp": {
+      "url": "https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz",
+      "sha256": "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
+    },
+    "mpfr": {
+      "url": "https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz",
+      "sha256": "b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01"
+    },
+    "configure_options": [
+      "--disable-threading",
+      "--without-python",
+      "--without-guile",
+      "--disable-tui"
+    ],
+    "libiconv": {
+      "url": "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-1.18.tar.gz",
+      "sha256": "3b08f5f4f9b4eb82f151a7040bfd6fe6c6fb922efe4b1659c66ea933276965e8"
+    }
+  }
+}

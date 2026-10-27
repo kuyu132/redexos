@@ -1,0 +1,8 @@
+[package]
+name = "redox-image"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+redoxfs = { path = "../../upstream/redoxfs", default-features = false, features = ["std", "log"] }
+redox_syscall = "0.9"

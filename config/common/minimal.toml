@@ -1,0 +1,58 @@
+# Installed as config/aarch64/pi-port-common.toml in each generated checkout.
+include = ["../minimal.toml"]
+
+[general]
+filesystem_size = 512
+efi_partition_size = 128
+
+[[files]]
+path = "/usr/lib/board-smoke.sh"
+mode = 0o755
+data = """
+#!/usr/bin/env bash
+set -eu
+printf 'REDOX_BOARD_SMOKE_BEGIN\\n'
+target=$(/usr/bin/cat /etc/port-target)
+case "$target" in
+    pi4b:*|pi5:*) ;;
+    *) printf 'FAIL port-target=%s\\n' "$target"; exit 10 ;;
+esac
+printf 'PASS port-target=%s\\n' "$target"
+
+test_file="/tmp/redox-board-smoke-$$"
+trap '/usr/bin/rm -f "$test_file"' EXIT
+printf 'redox-board-file-io\\n' > "$test_file"
+test "$(/usr/bin/cat "$test_file")" = redox-board-file-io
+printf 'PASS file-write-read\\n'
+
+test "$(printf 'redox-board-pipe\\n' | /usr/bin/cat)" = redox-board-pipe
+printf 'PASS pipe\\n'
+
+status=0
+/usr/bin/bash --noprofile --norc -c 'exit 37' || status=$?
+test "$status" = 37
+printf 'PASS child-exec-wait-exit-37\\n'
+
+/usr/bin/sleep 1
+printf 'PASS timer-sleep\\n'
+/usr/bin/rm -f "$test_file"
+trap - EXIT
+printf 'REDOX_BOARD_SMOKE_PASS\\n'
+"""
+
+[[files]]
+path = "/usr/lib/board-stability.sh"
+mode = 0o755
+data = """
+#!/usr/bin/env bash
+set -eu
+rounds=${1:-100}
+iteration=1
+printf 'REDOX_BOARD_STABILITY_BEGIN rounds=%s\\n' "$rounds"
+while test "$iteration" -le "$rounds"; do
+    /usr/bin/bash /usr/lib/board-smoke.sh
+    printf 'REDOX_BOARD_HEARTBEAT iteration=%s/%s\\n' "$iteration" "$rounds"
+    iteration=$((iteration + 1))
+done
+printf 'REDOX_BOARD_STABILITY_PASS rounds=%s\\n' "$rounds"
+"""

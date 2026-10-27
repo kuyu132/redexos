@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "recorded_date": "2026-10-25",
+  "boards": {
+    "pi4b": {
+      "implementation": "PFTF Raspberry Pi 4 EDK2 UEFI",
+      "version": "v1.52",
+      "url": "https://github.com/pftf/RPi4/releases/download/v1.52/RPi4_UEFI_Firmware_v1.52.zip",
+      "sha256": "3322ae85b1a74b1e67cb7bcf9e4af65299ae76e2db0af451e4ac6cd007c7a608",
+      "size": 3488154,
+      "dtb": "bcm2711-rpi-4-b.dtb",
+      "overlays": [
+        "miniuart-bt",
+        "upstream-pi4",
+        "redox-console"
+      ],
+      "status": "maintained experimental dependency",
+      "required_uefi_setting": "System Table Mode = Device Tree"
+    },
+    "pi5": {
+      "implementation": "WoR Raspberry Pi 5 TF-A + EDK2 UEFI",
+      "version": "v0.3",
+      "url": "https://github.com/worproject/rpi5-uefi/releases/download/v0.3/RPi5_UEFI_Release_v0.3.zip",
+      "sha256": "2337df318845448ebcc8a6a587d15dccec44b54c665ece21250d2f6170732724",
+      "size": 1252807,
+      "dtb": "bcm2712-rpi-5-b.dtb",
+      "overlays": [
+        "redox-console"
+      ],
+      "status": "archived experimental dependency",
+      "required_uefi_setting": "System Table Mode = Device Tree",
+      "limitations": [
+        "Upstream repository was archived in February 2025",
+        "Upstream only reports testing early BCM2712C1 boards; newer D0 boards require separate validation"
+      ]
+    }
+  }
+}

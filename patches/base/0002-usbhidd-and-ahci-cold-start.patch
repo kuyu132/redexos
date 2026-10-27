@@ -1,0 +1,138 @@
+diff --git a/drivers/input/usbhidd/src/main.rs b/drivers/input/usbhidd/src/main.rs
+index 7aaf479..fd7e3a3 100644
+--- a/drivers/input/usbhidd/src/main.rs
++++ b/drivers/input/usbhidd/src/main.rs
+@@ -320,9 +320,10 @@ fn main() -> Result<()> {
+ 
+     //TODO: do we need to set protocol to report? It fails for mice.
+ 
+-    //TODO: dynamically create good values, fix xhcid so it does not block on each request
+-    // This sets all reports to a duration of 4ms
+-    if let Err(err) = reqs::set_idle(&handle, 1, 0, interface_num as u16) {
++    // Report state changes; do not generate unchanged reports every 4 ms.
++    // QEMU gives keyboard and pointer separate controllers because xhcid's
++    // current scheme handler serializes blocking endpoint reads.
++    if let Err(err) = reqs::set_idle(&handle, 0, 0, interface_num as u16) {
+         log::warn!("failed to set idle: {}", err);
+     }
+ 
+@@ -425,11 +426,14 @@ fn main() -> Result<()> {
+     let mut last_buttons = [false, false, false];
+     let mut gamepad_state = HashMap::new();
+     loop {
+-        //TODO: get frequency from device
+-        //TODO: use sleeps when accuracy is better: thread::sleep(time::Duration::from_millis(10));
+-        let timer = time::Instant::now();
+-        while timer.elapsed() < time::Duration::from_millis(1) {
+-            thread::yield_now();
++        // Interrupt reads already block until the endpoint has a report.
++        // An extra yield loop delays draining queued key releases under TCG.
++        // Only control-transfer fallback needs software polling throttling.
++        if endpoint_opt.is_none() {
++            let timer = time::Instant::now();
++            while timer.elapsed() < time::Duration::from_millis(1) {
++                thread::yield_now();
++            }
+         }
+ 
+         if let Some(endpoint) = &mut endpoint_opt {
+diff --git a/drivers/storage/ahcid/src/ahci/hba.rs b/drivers/storage/ahcid/src/ahci/hba.rs
+index 84ddaea..ff99a9e 100644
+--- a/drivers/storage/ahcid/src/ahci/hba.rs
++++ b/drivers/storage/ahcid/src/ahci/hba.rs
+@@ -63,19 +63,43 @@ pub struct HbaPort {
+ }
+ 
+ impl HbaPort {
+-    pub fn probe(&self) -> HbaPortType {
+-        if self.ssts.readf(HBA_SSTS_PRESENT) {
+-            let sig = self.sig.read();
+-            match sig {
+-                HBA_SIG_ATA => HbaPortType::SATA,
+-                HBA_SIG_ATAPI => HbaPortType::SATAPI,
+-                HBA_SIG_PM => HbaPortType::PM,
+-                HBA_SIG_SEMB => HbaPortType::SEMB,
+-                _ => HbaPortType::Unknown(sig),
++    pub fn probe(&mut self) -> Result<HbaPortType> {
++        if !self.ssts.readf(HBA_SSTS_PRESENT) {
++            return Ok(HbaPortType::None);
++        }
++        // Firmware may never have touched this controller. PxSIG becomes valid
++        // only after the initial device-to-host FIS has been received.
++        if matches!(self.sig.read(), 0 | u32::MAX) {
++            self.stop()?;
++            let fb: Dma<[u8; 256]> = unsafe { Dma::zeroed()?.assume_init() };
++            self.fb[0].write(fb.physical() as u32);
++            self.fb[1].write((fb.physical() as u64 >> 32) as u32);
++            self.cmd.writef(HBA_PORT_CMD_FRE, true);
++            let timeout = Timeout::new(TIMEOUT);
++            let result = loop {
++                if !matches!(self.sig.read(), 0 | u32::MAX) {
++                    break Ok(());
++                }
++                if timeout.run().is_err() {
++                    break Err(Error::new(EIO));
++                }
++            };
++            if let Err(err) = self.stop() {
++                // DMA may still target this buffer when the controller is stuck.
++                std::mem::forget(fb);
++                return Err(err);
+             }
+-        } else {
+-            HbaPortType::None
++            self.fb[0].write(0);
++            self.fb[1].write(0);
++            result?;
+         }
++        Ok(match self.sig.read() {
++            HBA_SIG_ATA => HbaPortType::SATA,
++            HBA_SIG_ATAPI => HbaPortType::SATAPI,
++            HBA_SIG_PM => HbaPortType::PM,
++            HBA_SIG_SEMB => HbaPortType::SEMB,
++            sig => HbaPortType::Unknown(sig),
++        })
+     }
+ 
+     pub fn start(&mut self) -> Result<()> {
+@@ -95,7 +119,7 @@ impl HbaPort {
+         self.cmd.writef(HBA_PORT_CMD_ST, false);
+ 
+         let timeout = Timeout::new(TIMEOUT);
+-        while self.cmd.readf(HBA_PORT_CMD_FR | HBA_PORT_CMD_CR) {
++        while self.cmd.readf(HBA_PORT_CMD_CR) {
+             timeout.run().map_err(|()| {
+                 log::error!("HBA stop timed out");
+                 Error::new(EIO)
+@@ -103,6 +127,12 @@ impl HbaPort {
+         }
+ 
+         self.cmd.writef(HBA_PORT_CMD_FRE, false);
++        while self.cmd.readf(HBA_PORT_CMD_FR) {
++            timeout.run().map_err(|()| {
++                log::error!("HBA FIS receive stop timed out");
++                Error::new(EIO)
++            })?;
++        }
+         Ok(())
+     }
+ 
+diff --git a/drivers/storage/ahcid/src/ahci/mod.rs b/drivers/storage/ahcid/src/ahci/mod.rs
+index 4d8cc8c..93a25d8 100644
+--- a/drivers/storage/ahcid/src/ahci/mod.rs
++++ b/drivers/storage/ahcid/src/ahci/mod.rs
+@@ -50,7 +50,13 @@ pub fn disks(base: usize, name: &str) -> (&'static mut HbaMem, Vec<AnyDisk>) {
+         .filter(|&i| pi & 1 << i as i32 == 1 << i as i32)
+         .filter_map(|i| {
+             let port = unsafe { &mut *hba_mem.ports.as_mut_ptr().add(i) };
+-            let port_type = port.probe();
++            let port_type = match port.probe() {
++                Ok(kind) => kind,
++                Err(err) => {
++                    error!("{}-{}: signature probe failed: {}", name, i, err);
++                    return None;
++                }
++            };
+             info!("{}-{}: {:?}", name, i, port_type);
+ 
+             let disk: Option<AnyDisk> = match port_type {

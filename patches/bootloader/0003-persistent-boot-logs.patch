@@ -1,0 +1,786 @@
+diff --git a/src/boot_log.rs b/src/boot_log.rs
+new file mode 100644
+index 0000000..a273f71
+--- /dev/null
++++ b/src/boot_log.rs
+@@ -0,0 +1,99 @@
++//! Best-effort, per-boot FAT checkpoints. Never call firmware after finish().
++use core::{fmt, ptr};
++use spin::Mutex;
++use uefi::{fs::{File as RawFile, FILE_DIRECTORY, FILE_MODE_CREATE, FILE_MODE_READ, FILE_MODE_WRITE}, status::Status};
++use std::{fs::{File, FileSystem}, loaded_image::LoadedImage, proto::Protocol};
++use crate::boot_log_buffer::{Record, Sink, write_record};
++
++const MAX_BYTES: usize = 4 * 1024 * 1024;
++struct Log { file: File, bytes: usize }
++static LOG: Mutex<Option<Log>> = Mutex::new(None);
++
++impl Sink for File {
++    type Error = Status;
++    fn write(&mut self, bytes: &[u8]) -> Result<usize, Status> { File::write(self, bytes) }
++    fn flush(&mut self) -> Result<(), Status> {
++        let status = (self.0.Flush)(self.0);
++        if status == Status::SUCCESS { Ok(()) } else { Err(status) }
++    }
++}
++
++fn open(parent: &mut File, name: &[u16], mode: u64, attributes: u64) -> Result<File, Status> {
++    let mut child: *mut RawFile = ptr::null_mut();
++    let status = (parent.0.Open)(parent.0, &mut child, name.as_ptr(), mode, attributes);
++    if status != Status::SUCCESS { return Err(status); }
++    if child.is_null() { return Err(Status::DEVICE_ERROR); }
++    Ok(File(unsafe { &mut *child }))
++}
++
++fn wide<const N: usize>(name: &[u8; N]) -> [u16; N] {
++    let mut result = [0; N];
++    for i in 0..N { result[i] = name[i] as u16; }
++    result
++}
++
++fn create() -> Result<(File, usize), Status> {
++    let handle = LoadedImage::handle_protocol(std::handle())?.0.DeviceHandle;
++    let mut fs = FileSystem::handle_protocol(handle)?;
++    let mut root = fs.root()?;
++    let mode = FILE_MODE_CREATE | FILE_MODE_READ | FILE_MODE_WRITE;
++    let mut redexos = open(&mut root.0, &wide(b"redexos\0"), mode, FILE_DIRECTORY)?;
++    let mut directory = open(&mut redexos, &wide(b"logs\0"), mode, FILE_DIRECTORY)?;
++    for index in 1..=9999 {
++        let mut name = *b"BOOT0000.LOG\0";
++        let mut value = index;
++        for digit in (4..8).rev() { name[digit] = b'0' + (value % 10) as u8; value /= 10; }
++        let name = wide(&name);
++        match open(&mut directory, &name, FILE_MODE_READ, 0) {
++            Ok(previous) => drop(previous), // Never truncate a previous attempt.
++            Err(Status::NOT_FOUND) => {
++                let mut file = open(&mut directory, &name, mode, 0)?;
++                file.flush()?;
++                directory.flush()?;
++                redexos.flush()?;
++                root.0.flush()?;
++                return Ok((file, index));
++            }
++            Err(error) => return Err(error),
++        }
++    }
++    Err(Status::VOLUME_FULL)
++}
++
++pub fn init() {
++    std::io::_print(format_args!("[SD-LOG] Opening a new FAT boot log...\n"));
++    match create() {
++        Ok((file, index)) => {
++            *LOG.lock() = Some(Log { file, bytes: 0 });
++            output(format_args!("[SD-LOG] BEGIN v3 redexos/logs/BOOT{:04}.LOG; flush each record; UEFI only\n", index));
++        }
++        Err(error) => std::io::_print(format_args!("[SD-LOG] DISABLED: {:?}; boot continues with console diagnostics\n", error)),
++    }
++}
++
++pub fn output(args: fmt::Arguments) {
++    // Console first: a firmware Write/Flush that never returns must remain visible.
++    std::io::_print(args);
++    let Some(mut guard) = LOG.try_lock() else { return; }; // No recursive deadlock.
++    let Some(log) = guard.as_mut() else { return; };
++    let record = Record::format(args);
++    if record.bytes().len() > MAX_BYTES - log.bytes {
++        let _ = write_record(&mut log.file, b"\n[SD-LOG] LIMIT 4 MiB; disk logging stopped\n");
++        std::io::_print(format_args!("\n[SD-LOG] LIMIT 4 MiB; console diagnostics continue\n"));
++        *guard = None;
++        return;
++    }
++    match write_record(&mut log.file, record.bytes()) {
++        Ok(()) => log.bytes += record.bytes().len(),
++        Err(error) => {
++            std::io::_print(format_args!("\n[SD-LOG] DISABLED after write/flush error: {:?}\n", error));
++            *guard = None;
++        }
++    }
++}
++
++pub fn finish() {
++    output(format_args!("[SD-LOG] END UEFI; closing before ExitBootServices; kernel result unknown\n"));
++    // Close before obtaining the final memory map. Subsequent output cannot write FAT.
++    *LOG.lock() = None;
++}
+diff --git a/src/boot_log_buffer.rs b/src/boot_log_buffer.rs
+new file mode 100644
+index 0000000..b1f2642
+--- /dev/null
++++ b/src/boot_log_buffer.rs
+@@ -0,0 +1,51 @@
++//! Allocation-free records and checked writes, also exercised by host tests.
++use core::fmt::{self, Write};
++
++pub struct Record {
++    bytes: [u8; 2048],
++    len: usize,
++}
++
++impl Record {
++    pub fn format(args: fmt::Arguments) -> Self {
++        let mut record = Self { bytes: [0; 2048], len: 0 };
++        if record.write_fmt(args).is_err() {
++            let suffix = b" [TRUNCATED]\n";
++            record.bytes[2048 - suffix.len()..].copy_from_slice(suffix);
++            record.len = 2048;
++        }
++        record
++    }
++
++    pub fn bytes(&self) -> &[u8] { &self.bytes[..self.len] }
++}
++
++impl Write for Record {
++    fn write_str(&mut self, text: &str) -> fmt::Result {
++        let count = text.len().min(self.bytes.len() - self.len);
++        // Progress uses CR to overwrite the display. On disk keep every record.
++        for (to, from) in self.bytes[self.len..self.len + count].iter_mut().zip(text.bytes()) {
++            *to = if from == b'\r' { b'\n' } else { from };
++        }
++        self.len += count;
++        if count < text.len() { Err(fmt::Error) } else { Ok(()) }
++    }
++}
++
++pub trait Sink {
++    type Error;
++    fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error>;
++    fn flush(&mut self) -> Result<(), Self::Error>;
++}
++
++#[derive(Debug, PartialEq)]
++pub enum Failure<E> { Firmware(E), InvalidCount }
++
++pub fn write_record<S: Sink>(sink: &mut S, mut bytes: &[u8]) -> Result<(), Failure<S::Error>> {
++    while !bytes.is_empty() {
++        let count = sink.write(bytes).map_err(Failure::Firmware)?;
++        if count == 0 || count > bytes.len() { return Err(Failure::InvalidCount); }
++        bytes = &bytes[count..];
++    }
++    sink.flush().map_err(Failure::Firmware)
++}
+diff --git a/src/fs_trace.rs b/src/fs_trace.rs
+new file mode 100644
+index 0000000..0fb7b5a
+--- /dev/null
++++ b/src/fs_trace.rs
+@@ -0,0 +1,75 @@
++//! Memory-disk bounds and scoped tracing used while opening RedoxFS.
++
++pub fn checked_file_read(
++    data: &[u8],
++    block: u64,
++    block_size: u64,
++    out: &mut [u8],
++) -> Option<usize> {
++    let start = usize::try_from(block.checked_mul(block_size)?).ok()?;
++    let end = start.checked_add(out.len())?;
++    out.copy_from_slice(data.get(start..end)?);
++    Some(out.len())
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum ReadEvent {
++    Pending {
++        sequence: u64,
++        block: u64,
++        length: usize,
++    },
++    Returned {
++        sequence: u64,
++        count: usize,
++    },
++    Failed {
++        sequence: u64,
++    },
++}
++
++#[derive(Default)]
++pub struct ReadTrace {
++    enabled: bool,
++    count: u64,
++}
++
++impl ReadTrace {
++    pub fn start(&mut self) {
++        self.enabled = true;
++        self.count = 0;
++    }
++
++    pub fn stop(&mut self) -> u64 {
++        self.enabled = false;
++        self.count
++    }
++
++    pub fn read<E>(
++        &mut self,
++        block: u64,
++        length: usize,
++        read: impl FnOnce() -> Result<usize, E>,
++        mut emit: impl FnMut(ReadEvent),
++    ) -> Result<usize, E> {
++        if !self.enabled {
++            return read();
++        }
++        self.count += 1;
++        let sequence = self.count;
++        emit(ReadEvent::Pending {
++            sequence,
++            block,
++            length,
++        });
++        let result = read();
++        emit(match &result {
++            Ok(count) => ReadEvent::Returned {
++                sequence,
++                count: *count,
++            },
++            Err(_) => ReadEvent::Failed { sequence },
++        });
++        result
++    }
++}
+diff --git a/src/live_read.rs b/src/live_read.rs
+new file mode 100644
+index 0000000..ed62fc1
+--- /dev/null
++++ b/src/live_read.rs
+@@ -0,0 +1,79 @@
++//! Bounded firmware reads with progress emitted BEFORE every potentially blocking call.
++use alloc::vec::Vec;
++
++pub const READ_CHUNK: usize = 1024 * 1024;
++
++#[derive(Debug)]
++pub enum ReadError<E> {
++    Allocation {
++        size: usize,
++    },
++    Firmware {
++        offset: usize,
++        status: E,
++    },
++    UnexpectedEof {
++        offset: usize,
++        expected: usize,
++    },
++    InvalidCount {
++        offset: usize,
++        count: usize,
++        requested: usize,
++    },
++}
++
++#[derive(Debug)]
++pub enum ReadProgress {
++    Allocating {
++        size: usize,
++    },
++    Reading {
++        offset: usize,
++        total: usize,
++        requested: usize,
++    },
++    Complete {
++        size: usize,
++    },
++}
++
++pub fn read_image<E>(
++    size: usize,
++    mut read: impl FnMut(&mut [u8]) -> Result<usize, E>,
++    mut progress: impl FnMut(ReadProgress),
++) -> Result<Vec<u8>, ReadError<E>> {
++    progress(ReadProgress::Allocating { size });
++    let mut buffer = Vec::new();
++    buffer
++        .try_reserve_exact(size)
++        .map_err(|_| ReadError::Allocation { size })?;
++    buffer.resize(size, 0);
++    let mut offset = 0;
++    while offset < size {
++        let requested = (size - offset).min(READ_CHUNK);
++        progress(ReadProgress::Reading {
++            offset,
++            total: size,
++            requested,
++        });
++        let count = read(&mut buffer[offset..offset + requested])
++            .map_err(|status| ReadError::Firmware { offset, status })?;
++        if count == 0 {
++            return Err(ReadError::UnexpectedEof {
++                offset,
++                expected: size,
++            });
++        }
++        if count > requested {
++            return Err(ReadError::InvalidCount {
++                offset,
++                count,
++                requested,
++            });
++        }
++        offset += count;
++    }
++    progress(ReadProgress::Complete { size });
++    Ok(buffer)
++}
+diff --git a/src/main.rs b/src/main.rs
+index 489a7fe..333b41d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -4,9 +4,22 @@
+ extern crate alloc;
+ 
+ #[cfg(any(target_arch = "riscv64", target_os = "uefi"))]
+-#[macro_use]
++#[cfg_attr(not(all(target_os = "uefi", target_arch = "aarch64")), macro_use)]
+ extern crate uefi_std as std;
+ 
++// Interpose only the AArch64 UEFI console; BIOS and other targets retain their output.
++#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
++macro_rules! print { ($($arg:tt)*) => { crate::boot_log::output(format_args!($($arg)*)) }; }
++#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
++macro_rules! println {
++    () => { print!("\n") };
++    ($($arg:tt)*) => { print!("{}\n", format_args!($($arg)*)) };
++}
++#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
++mod boot_log;
++#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
++mod boot_log_buffer;
++
+ use alloc::{format, string::String, vec::Vec};
+ use core::{
+     cmp,
+@@ -24,6 +37,10 @@ mod os;
+ mod arch;
+ mod editor;
+ mod logger;
++#[cfg(any(target_os = "uefi", target_arch = "riscv64"))]
++mod live_read;
++#[cfg(any(target_os = "uefi", target_arch = "riscv64"))]
++mod fs_trace;
+ mod serial_16550;
+ 
+ const KIBI: usize = 1024;
+@@ -450,6 +467,10 @@ fn elf_entry(data: &[u8]) -> (u64, bool) {
+ }
+ 
+ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
++    #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
++    println!("[BOOT-DIAG v3] Boot checkpoints: redexos/logs/BOOTnnnn.LOG on the boot FAT.");
++    #[cfg(not(all(target_os = "uefi", target_arch = "aarch64")))]
++    println!("[BOOT-DIAG v2] Photograph the last stage/offset if progress stops.");
+     println!(
+         "Redox OS Bootloader {} on {}",
+         env!("CARGO_PKG_VERSION"),
+@@ -465,6 +486,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     };
+ 
+     let (mut fs, password_opt) = redoxfs(os);
++    println!("[BOOT-01] RedoxFS opened");
+ 
+     print!("RedoxFS ");
+     for i in 0..fs.header.uuid().len() {
+@@ -480,6 +502,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     let mut mode_opts = Vec::new();
+     let mut live = cfg!(feature = "live");
+     let mut edit_env = false;
++    println!("[BOOT-02] Select video mode with Enter to continue");
+     for output_i in 0..os.video_outputs() {
+         if output_i > 0 {
+             os.clear_text();
+@@ -494,6 +517,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     }
+ 
+     let live_opt = if live {
++        println!("[BOOT-03] Copying RedoxFS to live RAM disk");
+         let size = fs.header.size();
+ 
+         print!("live: 0/{} MiB", size / MIBI as u64);
+@@ -533,6 +557,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     };
+ 
+     let (kernel, kernel_entry) = {
++        println!("[BOOT-04] Loading kernel");
+         let kernel = load_to_memory(os, &mut fs, "usr/lib/boot/kernel", Filetype::Elf);
+         let (kernel_entry, kernel_64bit) = elf_entry(kernel);
+         unsafe {
+@@ -542,6 +567,7 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     };
+ 
+     let (bootstrap_size, bootstrap_base) = {
++        println!("[BOOT-05] Loading initfs");
+         let initfs_slice = load_to_memory(os, &mut fs, "usr/lib/boot/initfs", Filetype::Initfs);
+ 
+         let memory = unsafe {
+@@ -565,12 +591,14 @@ fn main(os: &impl Os) -> (usize, u64, KernelArgs) {
+     // Select the final video modes before taking the UEFI memory-map snapshot
+     // used to build the AArch64 page tables. SetMode may change the framebuffer
+     // address and its cacheability descriptors.
++    println!("[BOOT-06] Setting framebuffer mode");
+     for (output_i, mode_opt) in mode_opts.iter_mut().enumerate() {
+         if let Some(mode) = mode_opt {
+             os.set_video_mode(output_i, mode);
+         }
+     }
+ 
++    println!("[BOOT-07] Building page tables");
+     let page_phys = unsafe { paging_create(os, kernel.as_ptr() as u64, kernel.len() as u64) }
+         .expect("Failed to set up paging");
+ 
+diff --git a/src/os/uefi/arch/aarch64.rs b/src/os/uefi/arch/aarch64.rs
+index daab811..f9364b1 100644
+--- a/src/os/uefi/arch/aarch64.rs
++++ b/src/os/uefi/arch/aarch64.rs
+@@ -9,6 +9,28 @@ use crate::{
+ 
+ use super::super::{OsEfi, memory_map::memory_map};
+ 
++/// Observe firmware state without changing its exception or memory settings.
++pub fn print_boot_cpu_state() {
++    let (el, sp, control, fp): (u64, u64, u64, u64);
++    unsafe {
++        asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack));
++        asm!("mov {}, sp", out(reg) sp, options(nomem, nostack));
++        if el == 8 {
++            asm!("mrs {}, SCTLR_EL2", out(reg) control, options(nomem, nostack));
++            asm!("mrs {}, CPTR_EL2", out(reg) fp, options(nomem, nostack));
++        } else if el == 4 {
++            asm!("mrs {}, SCTLR_EL1", out(reg) control, options(nomem, nostack));
++            asm!("mrs {}, CPACR_EL1", out(reg) fp, options(nomem, nostack));
++        } else {
++            println!("[FS-CPU] Unexpected EL{} sp={:#x}", el >> 2, sp);
++            return;
++        }
++    }
++    println!("[FS-CPU] EL{} sp={:#x} sctlr={:#x} align_check={}",
++        el >> 2, sp, control, (control >> 1) & 1);
++    println!("[FS-CPU] {}={:#x}", if el == 8 { "cptr_el2" } else { "cpacr_el1" }, fp);
++}
++
+ unsafe fn dump_page_tables(table_phys: u64, table_virt: u64, table_level: u64) {
+     unsafe {
+         let entries = slice::from_raw_parts(table_phys as *const u64, PAGE_ENTRIES);
+@@ -197,6 +219,7 @@ unsafe extern "C" fn kernel_entry(
+ }
+ 
+ pub fn main() -> Result<()> {
++    crate::boot_log::init();
+     LOGGER.init();
+ 
+     let mut os = OsEfi::new();
+@@ -226,6 +249,9 @@ pub fn main() -> Result<()> {
+         );
+         println!("{:#x?}", args);
+ 
++        println!("[BOOT-08] Leaving UEFI; next output must come from the kernel");
++        crate::boot_log::finish();
++
+         kernel_entry(page_phys, stack, func, &args);
+     }
+ }
+diff --git a/src/os/uefi/device.rs b/src/os/uefi/device.rs
+index e4953da..837676c 100644
+--- a/src/os/uefi/device.rs
++++ b/src/os/uefi/device.rs
+@@ -12,6 +12,7 @@ use uefi::{
+ use uefi_std::{fs::FileSystem, loaded_image::LoadedImage, proto::Protocol};
+ 
+ use super::disk::{DiskEfi, DiskOrFileEfi};
++use crate::live_read::{read_image, ReadError, ReadProgress};
+ 
+ #[derive(Debug)]
+ enum DevicePathRelation {
+@@ -46,20 +47,22 @@ fn device_path_relation(a_path: &DevicePath, b_path: &DevicePath) -> DevicePathR
+     }
+ }
+ 
+-fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Option<Vec<u8>> {
++fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Result<Option<Vec<u8>>, Status> {
++    println!("[SD-01] Opening boot filesystem");
+     let mut esp_fs = match FileSystem::handle_protocol(esp_handle) {
+         Ok(esp_fs) => esp_fs,
+         Err(err) => {
+-            log::warn!("Failed to find SimpleFileSystem protocol: {:?}", err);
+-            return None;
++            println!("[BOOT-ERROR] SD-01 SimpleFileSystem: {:?}", err);
++            return Err(err);
+         }
+     };
+ 
++    println!("[SD-02] Opening boot directory");
+     let mut root = match esp_fs.root() {
+         Ok(root) => root,
+         Err(err) => {
+-            log::warn!("Failed to open ESP filesystem: {:?}", err);
+-            return None;
++            println!("[BOOT-ERROR] SD-02 OpenVolume: {:?}", err);
++            return Err(err);
+         }
+     };
+ 
+@@ -74,24 +77,53 @@ fn esp_live_image(esp_handle: Handle, esp_device_path: &DevicePath) -> Option<Ve
+     }
+ 
+     let filename = const { &as_utf16_str(*b"redox-live.iso\0") };
++    println!("[SD-03] Opening redox-live.iso");
+     let mut live_image = match root.open(filename) {
+         Ok(live_image) => live_image,
+-        Err(Status::NOT_FOUND) => return None,
++        Err(Status::NOT_FOUND) => {
++            println!("[SD-MISSING] redox-live.iso absent; falling back to raw RedoxFS scan");
++            return Ok(None);
++        },
+         Err(err) => {
+-            log::warn!(
+-                "Failed to open {}\\redox-live.iso: {:?}",
++            println!(
++                "[BOOT-ERROR] SD-03 {}\\redox-live.iso: {:?}",
+                 device_path_to_string(esp_device_path),
+                 err
+             );
+-            return None;
++            return Err(err);
+         }
+     };
+ 
+-    let mut buffer = Vec::new();
+-
+-    live_image.read_to_end(&mut buffer).unwrap();
+-
+-    Some(buffer)
++    println!("[SD-04] Getting redox-live.iso size");
++    let info = live_image.info().map_err(|err| {
++        println!("[BOOT-ERROR] SD-04 GetInfo: {:?}", err);
++        err
++    })?;
++    let size = usize::try_from(info.FileSize).ok().filter(|&size| size >= 520);
++    let Some(size) = size else {
++        println!("[BOOT-ERROR] SD-04 invalid live image size: {} bytes", info.FileSize);
++        return Err(Status::LOAD_ERROR);
++    };
++    println!("[SD-04] {} bytes; progress shows the next pending firmware read", size);
++    let buffer = read_image(size, |chunk| live_image.read(chunk), |event| match event {
++        ReadProgress::Allocating { size } =>
++            println!("[SD-ALLOC] Allocating/zeroing {} MiB", size / crate::MIBI),
++        ReadProgress::Reading { offset, total, requested } =>
++            print!("\r[SD-READ] {}/{} MiB ({}%) offset={:#x} len={:#x}     ",
++                offset / crate::MIBI, total / crate::MIBI,
++                offset as u128 * 100 / total as u128, offset, requested),
++        ReadProgress::Complete { size } =>
++            println!("\r[SD-DONE] {}/{} MiB (100%) bytes={}                         ",
++                size / crate::MIBI, size / crate::MIBI, size),
++    }).map_err(|err| {
++        println!("\n[BOOT-ERROR] SD-READ {:?}", err);
++        match err {
++            ReadError::Allocation { .. } => Status::OUT_OF_RESOURCES,
++            ReadError::Firmware { status, .. } => status,
++            _ => Status::LOAD_ERROR,
++        }
++    })?;
++    Ok(Some(buffer))
+ }
+ 
+ pub struct DiskDevice {
+@@ -127,7 +159,9 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+ 
+     if cfg!(feature = "live") {
+         // First try to get a live image from redox-live.iso. This is required to support netbooting.
+-        if let Some(buffer) = esp_live_image(esp_handle, esp_device_path.0) {
++        let live = esp_live_image(esp_handle, esp_device_path.0)
++            .unwrap_or_else(|err| panic!("Live image failed: {:?}; photograph [BOOT-ERROR] above", err));
++        if let Some(buffer) = live {
+             return vec![DiskDevice {
+                 handle: esp_handle,
+                 // Support both a copy of livedisk.iso and a standalone redoxfs partition
+@@ -137,7 +171,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+                 } else {
+                     0
+                 },
+-                disk: DiskOrFileEfi::File(buffer),
++                disk: DiskOrFileEfi::file(buffer),
+                 device_path: esp_device_path,
+                 file_path: Some("redox-live.iso"),
+             }];
+@@ -145,6 +179,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+     }
+ 
+     // Get all block I/O handles along with their block I/O implementations and device paths
++    println!("[FS-SCAN] Looking for raw RedoxFS block devices");
+     let handles = match DiskEfi::locate_handle() {
+         Ok(ok) => ok,
+         Err(err) => {
+@@ -190,7 +225,7 @@ pub fn disk_device_priority() -> Vec<DiskDevice> {
+                 //TODO: get block from partition table
+                 2 * crate::MIBI as u64
+             },
+-            disk: DiskOrFileEfi::Disk(disk),
++            disk: DiskOrFileEfi::disk(disk),
+             device_path,
+             file_path: None,
+         });
+diff --git a/src/os/uefi/disk.rs b/src/os/uefi/disk.rs
+index 1de3062..83b7039 100644
+--- a/src/os/uefi/disk.rs
++++ b/src/os/uefi/disk.rs
+@@ -5,26 +5,60 @@ use std::proto::Protocol;
+ use syscall::{EINVAL, EIO, Error, Result};
+ use uefi::block_io::BlockIo as UefiBlockIo;
+ use uefi::guid::Guid;
++use crate::fs_trace::{ReadEvent, ReadTrace, checked_file_read};
+ 
+-pub enum DiskOrFileEfi {
++enum DiskBackend {
+     Disk(DiskEfi),
+     File(Vec<u8>),
+ }
+ 
++pub struct DiskOrFileEfi {
++    inner: DiskBackend,
++    trace: ReadTrace,
++}
++
++impl DiskOrFileEfi {
++    pub fn file(data: Vec<u8>) -> Self {
++        Self { inner: DiskBackend::File(data), trace: ReadTrace::default() }
++    }
++
++    pub fn disk(disk: DiskEfi) -> Self {
++        Self { inner: DiskBackend::Disk(disk), trace: ReadTrace::default() }
++    }
++
++    pub fn start_open_trace(&mut self) {
++        if let DiskBackend::File(data) = &self.inner {
++            println!("[FS-RAM] base={:p} bytes={:#x}", data.as_ptr(), data.len());
++        }
++        self.trace.start();
++    }
++
++    pub fn finish_open_trace(&mut self) {
++        println!("\n[FS-READY] RedoxFS open returned; reads={}", self.trace.stop());
++    }
++}
++
+ impl redoxfs::Disk for DiskOrFileEfi {
+     unsafe fn read_at(&mut self, block: u64, buffer: &mut [u8]) -> syscall::Result<usize> {
+-        unsafe {
+-            match self {
+-                DiskOrFileEfi::Disk(disk_efi) => disk_efi.read_at(block, buffer),
+-                DiskOrFileEfi::File(data) => {
+-                    buffer.copy_from_slice(
+-                        &data[(block * redoxfs::BLOCK_SIZE) as usize
+-                            ..(block * redoxfs::BLOCK_SIZE) as usize + buffer.len()],
+-                    );
+-                    Ok(buffer.len())
+-                }
+-            }
+-        }
++        let inner = &mut self.inner;
++        self.trace.read(block, buffer.len(), || match inner {
++            DiskBackend::Disk(disk_efi) => unsafe { disk_efi.read_at(block, buffer) },
++            DiskBackend::File(data) => checked_file_read(data, block, BLOCK_SIZE, buffer)
++                .ok_or_else(|| {
++                    println!("\n[BOOT-ERROR] FS-RANGE block={:#x} len={:#x} image={:#x}",
++                        block, buffer.len(), data.len());
++                    Error::new(EIO)
++                }),
++        }, |event| match event {
++            ReadEvent::Pending { sequence, block, length } =>
++                print!("\r[FS-READ] #{} block={:#x} len={:#x} pending                  ",
++                    sequence, block, length),
++            ReadEvent::Returned { sequence, count } =>
++                print!("\r[FS-READ] #{} block={:#x} returned={:#x} processing         ",
++                    sequence, block, count),
++            ReadEvent::Failed { sequence } =>
++                println!("\n[BOOT-ERROR] FS-READ #{} block={:#x} failed", sequence, block),
++        })
+     }
+ 
+     unsafe fn write_at(&mut self, _block: u64, _buffer: &[u8]) -> syscall::Result<usize> {
+diff --git a/src/os/uefi/mod.rs b/src/os/uefi/mod.rs
+index f55d8e8..a83ace7 100644
+--- a/src/os/uefi/mod.rs
++++ b/src/os/uefi/mod.rs
+@@ -30,6 +30,27 @@ pub mod dtb;
+ mod memory_map;
+ mod video_mode;
+ 
++// Keep the probe's stack frame separate from the filesystem open call. This
++// validates only the first header; the library still selects the current ring
++// header and rebuilds the allocator itself.
++#[inline(never)]
++fn probe_header(disk: &mut DiskOrFileEfi, block: u64) -> syscall::Result<()> {
++    use redoxfs::Disk;
++    println!("[FS-PROBE] Initializing first header buffer");
++    let mut header = redoxfs::Header::default();
++    println!("[FS-PROBE] Reading first header at block={:#x} into={:p}", block, &header);
++    let count = unsafe { disk.read_at(block, &mut header)? };
++    if count != mem::size_of_val(&header) {
++        println!("\n[BOOT-ERROR] FS-PROBE short header: {} bytes", count);
++        return Err(syscall::Error::new(syscall::EIO));
++    }
++    println!("\n[FS-HASH] Checking first header signature/version/checksum");
++    let valid = header.valid();
++    println!("[FS-HASH] valid={} generation={} stored_hash={:#x}",
++        valid, header.generation(), header.hash.to_ne());
++    Ok(())
++}
++
+ #[cfg(target_arch = "riscv64")]
+ pub use arch::efi_get_boot_hartid;
+ 
+@@ -189,7 +210,7 @@ impl Os for OsEfi {
+ 
+         // Search for RedoxFS on disks in prioritized order
+         println!("Looking for RedoxFS:");
+-        for device in disk_device_priority() {
++        for mut device in disk_device_priority() {
+             if let Some(file_path) = device.file_path {
+                 log::debug!(
+                     " - {}\\{}",
+@@ -201,17 +222,30 @@ impl Os for OsEfi {
+             }
+ 
+             let block = device.partition_offset / redoxfs::BLOCK_SIZE;
++            println!("[FS-OPEN] source={} block={:#x}", device.file_path.unwrap_or("block device"), block);
++
++            #[cfg(target_arch = "aarch64")]
++            arch::print_boot_cpu_state();
++            device.disk.start_open_trace();
++            if let Err(err) = probe_header(&mut device.disk, block) {
++                println!("\n[BOOT-ERROR] FS-PROBE {:?}", err);
++                continue;
++            }
++            println!("[FS-CALL] Opening header ring and allocator; watch FS-READ");
+ 
+             match redoxfs::FileSystem::open(device.disk, password_opt, Some(block), false) {
+-                Ok(ok) => return Ok(ok),
++                Ok(mut ok) => {
++                    ok.disk.finish_open_trace();
++                    return Ok(ok);
++                },
+                 Err(err) => match err.errno {
+                     // Ignore header not found error
+-                    syscall::ENOENT => (),
++                    syscall::ENOENT => println!("\n[FS-REJECT] No valid header on this candidate"),
+                     // Bubble ENOKEY up later if we can't find another partition to return
+                     syscall::ENOKEY => seen_enokey = true,
+                     // Print any other errors
+                     _ => {
+-                        log::warn!("BlockIo error: {:?}", err);
++                        println!("\n[BOOT-ERROR] FS-OPEN: {:?}", err);
+                     }
+                 },
+             }
+@@ -222,7 +256,7 @@ impl Os for OsEfi {
+             return Err(syscall::Error::new(syscall::ENOKEY));
+         }
+ 
+-        log::warn!("No RedoxFS partitions found");
++        println!("[BOOT-ERROR] FS-SCAN: no valid RedoxFS found");
+         Err(syscall::Error::new(syscall::ENOENT))
+     }
+ 

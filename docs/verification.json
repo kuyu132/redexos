@@ -1,0 +1,611 @@
+{
+  "date": "2026-10-26",
+  "host": "macOS arm64",
+  "passed": [
+    "30 automated host tests including board DTB parsing/ranges translation, SD MBR construction/archive safety, end-to-end pseudo-serial board automation, locked patch application, idempotence, edit protection, tamper rejection and lost-UART-wakeup recovery; includes eight embedded Rust live-reader and memory-disk trace tests and new-file patch idempotence",
+    "Shell syntax checks",
+    "Both real upstream checkouts fetched at locked commit",
+    "Both board TOML include chains and core recipe pins parsed",
+    "Upstream make setenv resolves distinct board output paths",
+    "macOS ARM64 release compile/link: kernel, normal EFI, live EFI",
+    "AArch64 ELF/PE formats checked and five artifact SHA256 sums verified",
+    "QEMU virt AArch64: locally compiled kernel/EFI -> init -> root filesystem -> serial login",
+    "Three consecutive fresh QEMU instances: file write/read, pipe, Bash child exec/wait status 37, sleep and cleanup",
+    "Ion ordinary Bash launch: 3 fresh boots x 5 complete runs, returning to Ion; signal register regression passed",
+    "ARM64 TLS initialization/placement/TP alignment: old-layout negative control and final 5-run userspace regression",
+    "QEMU desktop terminal and editor actual keyboard/mouse, save/reopen/edit/readback verification",
+    "QEMU AHCI disk-backed root: GUI terminal/editor files survived process exit and fresh-process restart; offline and guest exact readback; additional automatic two-process persistence test and complete userspace smoke",
+    "QEMU persistent desktop network: automatic DHCP DORA, paired DNS response, verified TLS HTTPS 71193-byte download and SHA256 on 2 separate processes; network auto-recovered and previous download survived restart",
+    "QEMU guest-native GNU GDB: two fresh processes compiled as ordinary user, recovered from failed inferior startup, hit a Rust source breakpoint, read value 22, stepped to a distinct PC, produced a backtrace and exited normally; exact proof files survived shutdown",
+    "Pi 4B/Pi 5 locked firmware DTBs: PL011, UART IRQ, GIC-400, architected timer and translated MMIO offline contracts passed",
+    "Pi 5 root soc@107c000000 device-memory registration fix: ARM64 release build and fresh EFI-to-userspace QEMU regression passed",
+    "Pi 4B/Pi 5 flashable MBR/FAT32 images: critical files read back exactly, whole-image SHA256 recorded, compressed artifacts verified and each final image booted through QEMU EFI to userspace",
+    "Board serial automation: pseudo-terminal end-to-end capture/login/command/evidence test passed; final image board-smoke passed for both targets and a three-round stability probe passed for Pi 4B under QEMU",
+    "Pi 5 diagnostic image v1: final image booted to QEMU userspace with all 512 read offsets; three EFI invalid-image cases passed; actual GOP console screenshot visually checked",
+    "Pi 5 diagnostics v2 with byte-identical v1 live filesystem: normal QEMU EL1 and Cortex-A76/EL2 userspace boot, paired 261 filesystem reads, five invalid-image EFI cases and visually reviewed GOP filesystem checkpoints"
+  ],
+  "not_run": [
+    "Ubuntu container/system build",
+    "Pi 4B hardware boot; Pi 5 hardware kernel/userspace boot; both board SD/network/USB drivers",
+    "SMP, HVF, GPU acceleration and abrupt host power-loss recovery"
+  ],
+  "hardware_status": {
+    "pi4b": "not-tested",
+    "pi5": "v3: real FAT log recovered after macOS authorization. Last persisted FS-CALL, last screen FS-READ #2 pending. Kernel not reached. Captured card contents pass QEMU A76/EL2 userspace; real hardware root cause still undetermined."
+  },
+  "board_early_boot": {
+    "status": "offline-contract-passed",
+    "hardware_validated": false,
+    "firmware_dtb_revision": "88a0ae8876e800801ee5c27624138b3d02a21c63",
+    "evidence": "artifacts/board-baseline/20261025T063001Z",
+    "pi4b": {
+      "stdout": "serial0:115200n8",
+      "uart_physical_address": "0xfe201000",
+      "gic_physical_address": "0xff841000",
+      "dtb_sha256": "10f5ba94776526de5ad410c6da66c800e76e24951f95a3448bb0b474cffb7741"
+    },
+    "pi5": {
+      "stdout": "serial10:115200n8",
+      "uart_physical_address": "0x107d001000",
+      "gic_physical_address": "0x107fff9000",
+      "dtb_sha256": "03ce4742452ad52e3e8ec2259a0c705b496970e2b75e6e0b4e5446475ea1b926"
+    },
+    "limitations": [
+      "The actual firmware/EEPROM/UEFI handoff DTB has not been captured on hardware",
+      "No Pi kernel/userspace or runtime SD/network/USB/display validation; Pi 5 UEFI display observed in user photos"
+    ],
+    "report": "docs/board-early-boot.md"
+  },
+  "sd_card_images": {
+    "status": "offline-and-qemu-passed",
+    "hardware_validated": false,
+    "pi4b": {
+      "evidence": "artifacts/sd-image/20261025T063912Z-pi4b-23098b34",
+      "image_sha256": "b3e1657ab09750d670947c38d340ab3aa06790644b60258172e4f217a060793a",
+      "compressed_sha256": "5c08bf7cea9cd2d2bc8a1cd329d1e10922f90d6cb7f1ac1db39ce50aaf55194b",
+      "qemu_userspace": "artifacts/qemu-arm64/20261025T064012Z-9pmkrh2e",
+      "qemu_board_tests": "artifacts/qemu-arm64/20261025T064046Z-t46gw92l"
+    },
+    "pi5": {
+      "evidence": "artifacts/sd-image/20261025T235437Z-pi5-2nopy1j9",
+      "image_sha256": "8c3f37666d6b5da046c48838adb56f472def18333ad9aa6c950ec187d6b8261a",
+      "compressed_sha256": "7afdbfb64f03f85a9269343b948ebf62ff5599abd0f59114bf984104fad044ae",
+      "qemu_diagnostics": "artifacts/boot-diagnostics/20261025T235505Z-40e79mrx",
+      "log_tests": "artifacts/boot-log-tests/20261025T235505Z-ppw682cp",
+      "exact_live_filesystem_preserved": true,
+      "physical_logs_and_firmware_settings_preserved": true,
+      "hardware_validated": false
+    },
+    "report": "docs/hardware-testing.md",
+    "pi5_previous": {
+      "evidence": "artifacts/sd-image/20261025T063926Z-pi5-cdc8c510",
+      "image_sha256": "4e5ae708f310d18f18a46677f9c70e2558753f262a2f1ff12ef3bc1d35217def",
+      "compressed_sha256": "2e248bd5a0cb366de096daf6ef0316c728a86950f54116b5e081456879e19085",
+      "qemu_userspace": "artifacts/qemu-arm64/20261025T064028Z-0m4f5vd4",
+      "qemu_board_tests": "artifacts/qemu-arm64/20261025T064109Z-cwaikglq",
+      "firmware_limitation": "WoR UEFI v0.3 is archived and requires board-revision-specific validation"
+    },
+    "pi5_diagnostic_v1": {
+      "evidence": "artifacts/sd-image/20261025T135813Z-pi5-cc2f5425",
+      "image_sha256": "dea09ce337442a00953983e8cc1c40f0423310f2f3964c5877556c9098827fd2",
+      "compressed_sha256": "7c2571d6b52e44b915d4aea83edd697d01886f2436c365736586764d68a7f7d3",
+      "qemu_userspace": "artifacts/qemu-arm64/20261025T140119Z-7byi65zm",
+      "qemu_diagnostics": "artifacts/boot-diagnostics/20261025T140119Z-nr2fpj5_",
+      "firmware_limitation": "WoR UEFI v0.3 is archived and requires board-revision-specific validation"
+    },
+    "pi5_diagnostic_v3": {
+      "evidence": "artifacts/sd-image/20261025T151501Z-pi5-09rcnulj",
+      "image_sha256": "fa7fa113d99d5837497ea281860a3e739a110273886a2f7fc53244d335435ebd"
+    }
+  },
+  "component_build_evidence": "artifacts/macos-arm64/20261025T143939Z-xV3LSk",
+  "latest_board_common_regression": {
+    "status": "passed",
+    "kernel_rev": "72fcb44fa88c3a74ec9efaaba9082cb2e141caa1",
+    "kernel_patch_sha256": "8ed8d63a05c7def5a4e54fbfbc5c2730a7b68d702ae77192ea79bf8978fa20c7",
+    "kernel_sha256": "c9a1590368767d1d82ce18d39ecd76c8f4bc8870c13c8031a7357b732d7a898d",
+    "component_build_evidence": "artifacts/macos-arm64/20261025T062718Z-dzVdKK",
+    "qemu_evidence": "artifacts/qemu-arm64/20261025T062928Z-w4fabj6d",
+    "checks": [
+      "EFI to kernel to init to Ion to ordinary Bash",
+      "file, pipe, child exec/wait, timer, signal delivery and TLS",
+      "signal register x1/x2/x18 preservation"
+    ]
+  },
+  "qemu": {
+    "status": "passed",
+    "machine": "virt,gic-version=2,acpi=off",
+    "acceleration": "tcg",
+    "cpu": "cortex-a72",
+    "cpu_count": 1,
+    "memory_mib": 2048,
+    "kernel_origin": "local compilation with locked AArch64 signal-delivery patch",
+    "kernel_rev": "72fcb44fa88c3a74ec9efaaba9082cb2e141caa1",
+    "component_build_evidence": "artifacts/macos-arm64/20261022T092937Z-zHbUxh",
+    "userspace_origin": "official server live image plus locally compiled patched relibc.so",
+    "consecutive_cold_boot_passes": 3,
+    "evidence": [
+      "artifacts/qemu-arm64/20261022T094149Z-una9si9z",
+      "artifacts/qemu-arm64/20261022T094308Z-z21y6ok7",
+      "artifacts/qemu-arm64/20261022T094332Z-20ixzc_m"
+    ],
+    "limitations": [
+      "In-memory live root filesystem only; no persistence/network/display/USB/SMP validation",
+      "No Pi hardware validation"
+    ],
+    "failed_trials": {
+      "old_github_kernel": "artifacts/qemu-arm64/local-kernel-trial",
+      "new_gitlab_dtb_panic": "artifacts/qemu-arm64/current-kernel",
+      "ion_launch_exception": "artifacts/qemu-arm64/20261022T090938Z-sgskg68y"
+    },
+    "previous_exec_only_evidence": [
+      "artifacts/qemu-arm64/20261022T092036Z-uz8n5so1",
+      "artifacts/qemu-arm64/20261022T092047Z-90ja4650",
+      "artifacts/qemu-arm64/20261022T092058Z-a9puoms9"
+    ],
+    "relibc_build_evidence": "artifacts/macos-relibc/20261022T094141Z-yJeoAR",
+    "relibc_rev": "39e84406c8a42acbc4f4be002e04b8bbd704a335",
+    "ordinary_bash_launches_per_boot": 5,
+    "total_verified_ordinary_bash_launches": 15,
+    "patches": [
+      {
+        "path": "patches/kernel/0001-aarch64-deliver-signals-after-syscall-result.patch",
+        "sha256": "af6a7fe088050e1aa5335b3d4501055660b6d8f7f63184183d821ad8d59df315"
+      },
+      {
+        "path": "patches/relibc/0001-aarch64-restore-signal-x1-x2-in-order.patch",
+        "sha256": "78cd0944f01b96c56257f264894b65f3fc219f658a9659d1bf291cb9b8c845eb"
+      }
+    ],
+    "ion_bash_fix": {
+      "status": "passed",
+      "diagnostic_evidence": "artifacts/qemu-arm64/20261022T092543Z-09z0f_3s",
+      "negative_controls": {
+        "old_kernel": "artifacts/qemu-arm64/20261022T094248Z-xzw4tbi4",
+        "old_relibc": "artifacts/qemu-arm64/20261022T094257Z-g7f57_a_"
+      },
+      "host_test_log": "work/debug-ion/host-tests.log",
+      "report": "docs/ion-bash-fix.md"
+    },
+    "record_scope": "Historical Ion/Bash signal-fix baseline; latest combined baseline is desktop and latest_userspace_regression below"
+  },
+  "latest_userspace_regression": {
+    "status": "passed",
+    "evidence": "artifacts/qemu-arm64/20261022T115349Z-fao5xmqr",
+    "ordinary_bash_launches": 5,
+    "includes": "signals, timers, 8-thread TLS, cross-DSO TLSDESC, runtime 64-byte alignment and 5000-byte TLS",
+    "kernel_build": "artifacts/macos-arm64/20261022T113832Z-lXA9QC",
+    "relibc_build": "artifacts/macos-relibc/20261022T115247Z-FIdsfy"
+  },
+  "desktop": {
+    "status": "passed",
+    "evidence": "artifacts/qemu-arm64/20261022T115400Z-w6qj5wb4",
+    "diagnostic_combined_evidence": "artifacts/qemu-arm64/20261022T114027Z-0193dimv",
+    "profile": "desktop",
+    "cpu_count": 1,
+    "memory_mib": 4096,
+    "acceleration": "tcg",
+    "display": "ramfb 1024x768; QMP screenshot and USB event injection",
+    "usb_layout": "separate-xhci-controllers",
+    "kernel_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-arm64/20261022T113832Z-lXA9QC",
+    "relibc_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-relibc/20261022T115247Z-FIdsfy",
+    "usbhidd_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-usbhidd/20261022T115333Z-98g8ze6i",
+    "image": "/Users/kuyuzhiqi/Documents/Workspace/redexos/work/qemu-arm64/image-58eagxqy/esp.img",
+    "image_sha256": "658f19b8dbd0755934504b3022e1d049e86d0aa16f8d7522da3d37960b02fc61",
+    "checks": [
+      "USB keyboard mixed text exact 74-byte save/readback at 25 ms per key event",
+      "COSMIC editor close/reopen/edit/Ctrl+S exact 99-byte readback",
+      "COSMIC terminal ordinary Ion -> Bash script execution and return",
+      "Full userspace smoke passed in GUI terminal including 8-thread TLS and runtime alignment",
+      "Mouse clicks, Shift/Ctrl shortcuts and app launching"
+    ],
+    "host_tests": "work/debug-desktop/host-tests-final.log",
+    "report": "docs/desktop-fix.md",
+    "limitations": [
+      "Live in-memory filesystem; no reboot persistence",
+      "QEMU single CPU and software rendering only",
+      "Separate xHCI controllers are required for this HID configuration",
+      "No Pi hardware validation; no network/SMP/HVF/GPU validation"
+    ],
+    "record_scope": "Historical live desktop verification; persistence verified separately in persistence"
+  },
+  "persistence": {
+    "status": "passed",
+    "first_process": "artifacts/qemu-arm64/20261022T131636Z-gkuhppue",
+    "second_process": "artifacts/qemu-arm64/20261022T132134Z-8wg_33t9",
+    "terminal_file": "/home/user/terminal-persist.txt",
+    "terminal_exact_bytes": 42,
+    "editor_file": "/home/user/editor-persist.txt",
+    "editor_exact_bytes": 87,
+    "creation": "actual GUI terminal/COSMIC editor via QMP USB events",
+    "checks": [
+      "exact readback before exit",
+      "first QEMU process exited with status 0",
+      "offline root.img exact readback with QEMU stopped",
+      "fresh QEMU process mounted same root.img",
+      "exact readback after restart",
+      "GUI terminal cat readback and COSMIC editor reopen",
+      "GUI files survived two additional automated cold boots"
+    ],
+    "automated_regression": "artifacts/qemu-persistence/20261022T132605Z-2ixg4pkd",
+    "boot_image_hash_unchanged": true,
+    "root_disk": "/Users/kuyuzhiqi/Documents/Workspace/redexos/work/qemu-arm64/persistent-desktop/root.img",
+    "kernel_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-arm64/20261022T130436Z-ZwbeB8",
+    "ahcid_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-ahcid/20261022T130443Z-zcmpvm54",
+    "usbhidd_build": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-usbhidd/20261022T130535Z-oqh2ebu1",
+    "disk_size_bytes": 4294967296,
+    "root_controller": "ich9-ahci",
+    "root_cache": "writethrough",
+    "snapshot": false,
+    "host_tests": "work/persistence-probe/host-tests-final.log",
+    "host_test_count": 12,
+    "no_overwrite_check": "work/persistence-probe/no-overwrite-test.log",
+    "exclusive_lock_check": "work/persistence-probe/lock-test.log",
+    "negative_controls": [
+      "work/persistence-probe/serial.log",
+      "work/persistence-probe/ahci-bootroot-serial.log",
+      "work/persistence-probe/patched-ahci-serial.log"
+    ],
+    "report": "docs/qemu-persistence.md"
+  },
+  "network": {
+    "status": "passed",
+    "url": "https://gitlab.redox-os.org/redox-os/base/-/raw/06bd7b3ffb16c547f9cc545d16d39b325e3f67d4/Cargo.lock",
+    "sha256": "d998d1ee7048243693019dbd905ad3ae31e5323a8c465d6ccc7ad1bbd542fc1b",
+    "bytes": 71193,
+    "root_disk": "/Users/kuyuzhiqi/Documents/Workspace/redexos/work/qemu-arm64/persistent-desktop/root.img",
+    "boots": [
+      "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/qemu-arm64/20261022T141957Z-95fumila",
+      "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/qemu-arm64/20261022T142013Z-3n4y9qxq"
+    ],
+    "downloads": [
+      "/home/root/qemu-network-4512a3cbdb584cf2b535a76c7fe10f51-1.lock",
+      "/home/root/qemu-network-4512a3cbdb584cf2b535a76c7fe10f51-2.lock"
+    ],
+    "checks": [
+      "DHCP DORA and runtime configuration each boot",
+      "paired DNS A lookup each boot",
+      "TLS certificate verification each boot",
+      "HTTPS exact SHA256 and size each boot",
+      "download persisted across fresh QEMU process",
+      "automatic network recovery without manual guest configuration"
+    ],
+    "evidence": "artifacts/qemu-network/20261022T141956Z-gu67ngzm",
+    "configuration": {
+      "backend": "QEMU user NAT",
+      "nic": "E1000",
+      "mac": "52:54:00:12:34:56",
+      "address": "10.0.2.15/24",
+      "gateway": "10.0.2.2",
+      "dns": "10.0.2.3",
+      "automatic_at_boot": true,
+      "default_for_persistent_desktop": true
+    },
+    "temporary_downloads_removed": true,
+    "e1000d_sha256": "623c4f768ad64ad01dbccc8073736797dc93a908042c56c136803c3d6c8e95cc",
+    "saved_desktop_files_preserved": {
+      "/home/user/terminal-persist.txt": "06384ab4d6a372bf271f331ebf6df5b33b76cd6517755a4dd92456601902187e",
+      "/home/user/editor-persist.txt": "7d789a35586793d5824ee1ca10d7aff6e86831e8f867d2dc06b3c250ceeb448e"
+    },
+    "boot_image_unchanged": true,
+    "host_test_count": 12,
+    "host_tests": "work/network-probe/host-tests.log",
+    "report": "docs/qemu-network.md"
+  },
+  "development": {
+    "status": "passed",
+    "date": "2026-10-24",
+    "target": "aarch64-unknown-redox QEMU virt, one CPU TCG, persistent desktop",
+    "report": "docs/qemu-development.md",
+    "interactive_evidence": "artifacts/qemu-development/20261023T132723Z",
+    "source_entered_in_editor": {
+      "input": 21,
+      "output": 42,
+      "evidence": "artifacts/qemu-arm64/20261023T130839Z-2xhdul_k"
+    },
+    "source_modified_in_editor": {
+      "input": 22,
+      "output": 44,
+      "evidence": "artifacts/qemu-arm64/20261023T133057Z-wjvpa_u8/08-editor-saved.png"
+    },
+    "final_desktop_evidence": "artifacts/qemu-arm64/20261023T140232Z-3v767rkl",
+    "cold_boot_regression": "artifacts/qemu-development/20261023T140456Z-6ooso9uq",
+    "cold_boot_result": {
+      "status": "passed",
+      "expected": "44",
+      "root_disk": "/Users/kuyuzhiqi/Documents/Workspace/redexos/work/qemu-arm64/persistent-desktop/root.img",
+      "boots": [
+        {
+          "evidence": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/qemu-arm64/20261023T140458Z-t_07bt09",
+          "hashes": {
+            "hello.rs": "9acae58489a3fc2eddfd69bf30b6a9580fd376145c7ce180a6598455ef3e0a6b",
+            "hello": "5047fc0f507a66cc726d21d0bb95d0c397bee1db2b97ccb92c4a86ec9ebd72e2"
+          },
+          "sections": {
+            ".text": 194104,
+            ".symtab": 83784,
+            ".debug_info": 43689,
+            ".debug_line": 24788
+          }
+        },
+        {
+          "evidence": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/qemu-arm64/20261023T140527Z-b3zr4jw8",
+          "hashes": {
+            "hello.rs": "9acae58489a3fc2eddfd69bf30b6a9580fd376145c7ce180a6598455ef3e0a6b",
+            "hello": "5047fc0f507a66cc726d21d0bb95d0c397bee1db2b97ccb92c4a86ec9ebd72e2"
+          },
+          "sections": {
+            ".text": 194104,
+            ".symtab": 83784,
+            ".debug_info": 43689,
+            ".debug_line": 24788
+          }
+        }
+      ]
+    },
+    "debug": {
+      "status": "passed",
+      "date": "2026-10-24",
+      "backend": "GNU GDB inside the Redox guest through native ARM64 ptrace",
+      "guest_native_debugger": true,
+      "report": "docs/qemu-native-debugging.md",
+      "evidence": "artifacts/qemu-native-debug/20261024T040117Z-v6fqu8rt",
+      "boots": [
+        "artifacts/qemu-arm64/20261024T040119Z-fe_nxvyc",
+        "artifacts/qemu-arm64/20261024T040736Z-0zj13anc"
+      ],
+      "fresh_qemu_processes": 2,
+      "ordinary_user_desktop_gdb": true,
+      "observed_argument": 22,
+      "observed_result": 44,
+      "source_breakpoint": true,
+      "source_step": true,
+      "backtrace": true,
+      "failed_start_recovery": true,
+      "guest_responsive_while_inferior_stopped": true,
+      "reboot_persistence": true,
+      "loader_stress_launches_per_boot": 65,
+      "signal_register_restore": [
+        "x1",
+        "x2",
+        "x18"
+      ],
+      "argument_dump_sha256": "9bb57922dc1a9aa3c4a6dcb92467700e2d5c80ff5906c5a3e3487c0321c50e6a",
+      "post_step_pc": "0x50000368",
+      "post_step_pc_dump_sha256": "696f1c94e7d2ca99411ec53e505a5f9f17f1141f8c313f762450a6d550d03868",
+      "source_sha256": "9acae58489a3fc2eddfd69bf30b6a9580fd376145c7ce180a6598455ef3e0a6b",
+      "elf_sha256": "4174bd24919b305a07c8c6571dd8b2197e9e4f9a8052a89db3e5c38418a39d3d",
+      "kernel_build": "artifacts/macos-arm64/20261024T024755Z-mHHcFN",
+      "relibc_build": "artifacts/macos-relibc/20261024T024805Z-FJE5BH",
+      "gdb_build": "artifacts/macos-native-debug/20261024T024820Z-bnu8ltzw",
+      "host_stub_reference": {
+        "backend": "macOS Apple LLDB -> QEMU GDB stub on 127.0.0.1",
+        "elf": "artifacts/qemu-development/20261023T132723Z/final/hello",
+        "log": "artifacts/qemu-development/20261023T132723Z/final/lldb.log"
+      },
+      "limitations": [
+        "General-purpose registers only; floating-point/SIMD registers and hardware watchpoints are not implemented",
+        "Validated for direct same-identity single-thread children; arbitrary attach and multithread targets are not validated",
+        "QEMU single CPU only; SMP and Pi hardware are not validated"
+      ]
+    },
+    "filesystem": {
+      "components": "/Users/kuyuzhiqi/Documents/Workspace/redexos/artifacts/macos-redoxfs/20261023T140100Z-e265j_py",
+      "sha256": "b266df0081e96849e1a245dc01fc391fcb719280ad56e8faa6b40b5bbc3131ee",
+      "source": {
+        "url": "https://gitlab.redox-os.org/redox-os/redoxfs.git",
+        "rev": "b87b0976ee122036b2ec040159b890e1e06ca139",
+        "patch": {
+          "path": "patches/redoxfs/0001-release-closed-mapping-cache.patch",
+          "sha256": "cb1e38764603a8f50056056270dff82be0a5d06e40db7c080517201baa8c5447"
+        }
+      },
+      "negative_control": "work/development-probe/cache-negative-result.txt",
+      "negative_exit": 10,
+      "negative_iteration": 0,
+      "positive_control": "artifacts/qemu-development/20261023T132723Z/fs-cache-fixed.txt",
+      "positive_cycles": 32,
+      "backup": "work/development-probe/before-redoxfs-fix",
+      "install_backups": "work/qemu-arm64/filesystem-backups"
+    },
+    "sdk": "artifacts/qemu-development/20261023T132723Z/sdk-install.json",
+    "packages": "qemu/development/packages-record.json",
+    "host_tests": "work/native-debug/host-tests-final-20261024T1213.log",
+    "host_test_count": 16,
+    "saved_files_and_libc_preserved": {
+      "/usr/lib/libc.so": "3c7e831b3661ce3725cbdf9c2dc7bb6081b172737ff285b62946f270b4761717",
+      "/home/user/terminal-persist.txt": "06384ab4d6a372bf271f331ebf6df5b33b76cd6517755a4dd92456601902187e",
+      "/home/user/editor-persist.txt": "7d789a35586793d5824ee1ca10d7aff6e86831e8f867d2dc06b3c250ceeb448e",
+      "/home/user/network-Cargo.lock": "d998d1ee7048243693019dbd905ad3ae31e5323a8c465d6ccc7ad1bbd542fc1b"
+    },
+    "validation_scope": "Dependency-free native Rust binary via dev-rustc/Make plus guest-native GNU GDB source breakpoint, register access, single-step and backtrace. Cargo version only; C/C++ toolchain, third-party Cargo builds, multithread debugging and Pi boards are not validated."
+  },
+  "boot_diagnostics": {
+    "status": "qemu-and-host-tests-passed",
+    "revision": "v3",
+    "hardware_validated": false,
+    "evidence": "artifacts/boot-diagnostics/20261025T151649Z-gpmlw8x2",
+    "component_build_evidence": "artifacts/macos-arm64/20261025T151415Z-6iMOrQ",
+    "bootloader_patch_sha256": "c85f34656f591cc47559d9affae48556e940ec559b6a959fbe0d8731d9390a43",
+    "report": "docs/boot-logs-v3.md",
+    "host_test_count": 33,
+    "embedded_rust_tests": 12,
+    "gop_capture_note": "Original GOP screenshot reviewed and passed; repeated PNGs are byte-identical and complete. App image-display artifact, no QEMU display change required."
+  },
+  "latest_pi5_flash": {
+    "status": "passed",
+    "diagnostic_revision": "v4",
+    "evidence": "artifacts/hardware/pi5-v4-flash-20261025T235725Z-1eujixga",
+    "image_sha256": "8c3f37666d6b5da046c48838adb56f472def18333ad9aa6c950ec187d6b8261a",
+    "tool": "Raspberry Pi Imager",
+    "readback_verified": true,
+    "device_absent_after_imager": true,
+    "hardware_boot_validated": false,
+    "previous_physical_boot_log_preserved": true
+  },
+  "latest_pi5_boot_observation": {
+    "status": "last-stage-observed",
+    "board": "pi5",
+    "diagnostic_revision": "v2",
+    "exception_level": "EL2",
+    "hardware_descriptor": "DeviceTree(37bb0000, 14f00)",
+    "live_read_completed_bytes": 536870912,
+    "first_header_valid": true,
+    "first_header_generation": 8960,
+    "first_header_hash": "0xaf6fae3dedd232b0",
+    "sctlr_el2": "0x30c5183d",
+    "alignment_check": 0,
+    "cptr_el2": "0x33ff",
+    "last_marker": "[FS-READ] #259 block=0x2f70 returned=0x1000 processing",
+    "redoxfs_open_confirmed": false,
+    "kernel_boot_confirmed": false,
+    "root_cause": "undetermined",
+    "evidence_directory": "artifacts/hardware/pi5-v2-read259-20261025T151150Z-iwxxudy0",
+    "photo_sha256": "16e7dd277b96665a5c719f3b2c04381740a24969ce384b2ceddd31f56c6384ef",
+    "next_hardware_check": "Boot v3; verify SD-LOG BEGIN; after power-off collect redexos/logs/BOOTnnnn.LOG."
+  },
+  "pi5_el2_comparison": {
+    "status": "passed",
+    "environment": "QEMU virt, Cortex-A76, virtualization=on",
+    "observed_el2": true,
+    "redoxfs_open_and_userspace_passed": true,
+    "hardware_failure_reproduced": false,
+    "evidence": "artifacts/boot-diagnostics/20261025T141643Z-el2-a76-zc9wtmb1"
+  },
+  "boot_diagnostics_v1": {
+    "status": "qemu-and-host-tests-passed",
+    "hardware_validated": false,
+    "evidence": "artifacts/boot-diagnostics/20261025T140119Z-nr2fpj5_",
+    "component_build_evidence": "artifacts/macos-arm64/20261025T135635Z-08UNHq",
+    "bootloader_patch_sha256": "60ca6a8583bcde2ec867301997fa63c974709c0917315c767c13f1c7fea9af1a",
+    "report": "docs/boot-diagnostics.md"
+  },
+  "pi5_diagnostic_v1_flash": {
+    "status": "passed",
+    "evidence": "artifacts/hardware/pi5-diag-flash-20261025T140848Z-_pq5enpn",
+    "image_sha256": "dea09ce337442a00953983e8cc1c40f0423310f2f3964c5877556c9098827fd2",
+    "tool": "Raspberry Pi Imager",
+    "readback_verified": true,
+    "device_absent_after_imager": true,
+    "hardware_boot_validated": false
+  },
+  "boot_diagnostics_v2": {
+    "status": "qemu-and-host-tests-passed",
+    "revision": "v2",
+    "hardware_validated": false,
+    "evidence": "artifacts/boot-diagnostics/20261025T144248Z-el_ri2uf",
+    "component_build_evidence": "artifacts/macos-arm64/20261025T143939Z-xV3LSk",
+    "bootloader_patch_sha256": "4c083dce2364fbabaeae12a01b9af220a1ac98e6305551593d5927181175e9f0",
+    "report": "docs/boot-diagnostics-v2.md"
+  },
+  "boot_log_persistence": {
+    "status": "passed-in-qemu",
+    "hardware_validated": false,
+    "evidence": "artifacts/boot-log-tests/20261025T151649Z-oafknk4z",
+    "negative_control": "artifacts/boot-log-tests/20261025T150837Z-uyl76o1n/legacy-readback/report.json",
+    "scope": "AArch64 UEFI pre-ExitBootServices; per-attempt FAT log, flushed checkpoints, extraction and reboot preservation",
+    "physical_sd_readback": "not validated: macOS access denied",
+    "image_manifest": "artifacts/sd-image/20261025T151501Z-pi5-09rcnulj/manifest.json"
+  },
+  "previous_pi5_boot_observation": {
+    "evidence_directory": "artifacts/hardware/pi5-v1-dtb-fs-open-20261025T144343Z-cua_7pk_",
+    "status": "same-last-stage-observed",
+    "board": "pi5",
+    "evidence": "user photo after switching to Device Tree",
+    "diagnostic_revision": "v1",
+    "exception_level": "EL2",
+    "hardware_descriptor": "DeviceTree(37bb0000, 14f00)",
+    "live_read_completed_bytes": 536870912,
+    "last_marker": "[FS-OPEN] source=redox-live.iso block=0x200",
+    "redoxfs_open_confirmed": false,
+    "kernel_boot_confirmed": false,
+    "root_cause": "undetermined",
+    "next_hardware_check": "Boot diagnostic v2, preserve Device Tree mode, photograph the last FS-PROBE/FS-HASH/FS-READ line."
+  },
+  "pi5_v3_flash": {
+    "status": "passed",
+    "diagnostic_revision": "v3",
+    "evidence": "artifacts/hardware/pi5-v3-flash-20261025T152532Z-y880v27w",
+    "image_sha256": "fa7fa113d99d5837497ea281860a3e739a110273886a2f7fc53244d335435ebd",
+    "tool": "Raspberry Pi Imager",
+    "readback_verified": true,
+    "device_absent_after_imager": true,
+    "hardware_boot_validated": false
+  },
+  "pi5_diagnostic_v2_flash": {
+    "status": "passed",
+    "diagnostic_revision": "v2",
+    "evidence": "artifacts/hardware/pi5-v2-flash-20261025T145118Z-7_0yuovl",
+    "image_sha256": "ee5b029b18a230cb0f1af07af00671e26be906b039050b18f353602629e42097",
+    "tool": "Raspberry Pi Imager",
+    "readback_verified": true,
+    "device_absent_after_imager": true,
+    "hardware_boot_validated": false
+  },
+  "latest_pi5_hardware_observation": {
+    "evidence": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87",
+    "observation": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87/observation.json",
+    "status": "boot-stopped; physical log recovered; root cause undetermined",
+    "physical_log_collected": true,
+    "sd_modified_this_diagnosis": false,
+    "hardware_boot_validated": false,
+    "readback": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87/readback.json",
+    "log_report": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87/collected/report.json",
+    "qemu_replay": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87/qemu-replay/result.json"
+  },
+  "pi5_sd_log_readback": {
+    "status": "passed",
+    "date_local": "2026-10-26",
+    "source_device": "/dev/disk6s1",
+    "source_modified": false,
+    "backup_sha256": "0d57d2ca70e0f266c1dceee61da88a6216aaedfa9f288e276150f764af3e8880",
+    "partition_bytes": 804257792,
+    "log_sha256": "2a5d9010d99eb513ba0d9e0dc341dd30039305cb4a57c131ddc6f219310f646c",
+    "evidence": "artifacts/hardware/pi5-v3-read2-20261025T153456Z-uk_q1b87",
+    "firmware_code_unchanged": true,
+    "live_image_unchanged": true,
+    "efi_loader_unchanged": true,
+    "physical_boot_failure_fixed": false
+  },
+  "boot_diagnostics_v4": {
+    "status": "passed",
+    "evidence": "artifacts/boot-diagnostics/20261025T235505Z-40e79mrx",
+    "hardware_validated": false,
+    "io_stage_groups_per_boot": 4,
+    "purpose": "diagnostic call-boundary visibility, not a verified hardware fix"
+  },
+  "boot_log_persistence_v4": {
+    "status": "passed",
+    "evidence": "artifacts/boot-log-tests/20261025T235505Z-ppw682cp",
+    "existing_real_hardware_log_preserved": true,
+    "hardware_boot_validated": false
+  },
+  "latest_bootloader_component_build": "artifacts/macos-arm64/20261025T235333Z-JmgInp",
+  "pi5_v4_flash": {
+    "status": "passed",
+    "diagnostic_revision": "v4",
+    "evidence": "artifacts/hardware/pi5-v4-flash-20261025T235725Z-1eujixga",
+    "image_sha256": "8c3f37666d6b5da046c48838adb56f472def18333ad9aa6c950ec187d6b8261a",
+    "tool": "Raspberry Pi Imager",
+    "readback_verified": true,
+    "device_absent_after_imager": true,
+    "hardware_boot_validated": false,
+    "previous_physical_boot_log_preserved": true
+  },
+  "boot_isolation": {
+    "date": "2026-10-26",
+    "status": "passed",
+    "scope": "host + QEMU isolation probes only",
+    "build": "artifacts/boot-isolation-build/20261026T023110Z-xeyec4pl",
+    "evidence": "artifacts/boot-isolation-tests/20261026T023120Z-348e00ut",
+    "efi_sha256": "8ed71864aa5de7306769b3db7eba339bf41689e41d601a1800e0d6daeb9b0326",
+    "test_cases": 16,
+    "host_test_count": 35,
+    "hardware_status": "not-tested",
+    "physical_root_cause": "undetermined",
+    "v4_hardware_result": "not-tested; user confirmed",
+    "sd_written": false,
+    "fix_image_released": false,
+    "report": "docs/boot-isolation.md"
+  }
+}

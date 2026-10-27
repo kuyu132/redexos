@@ -1,0 +1,99 @@
+diff --git a/src/bin/mount.rs b/src/bin/mount.rs
+index 2811665..582c75b 100644
+--- a/src/bin/mount.rs
++++ b/src/bin/mount.rs
+@@ -362,7 +362,27 @@ fn daemon(
+ }
+ 
+ fn main() {
++    #[cfg(not(target_os = "redox"))]
+     env_logger::init();
++    #[cfg(target_os = "redox")]
++    {
++        // Early static ARM64 services cannot use env_logger's TLS buffer.
++        struct BootLogger;
++        impl log::Log for BootLogger {
++            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
++                metadata.level() <= log::Level::Info
++            }
++            fn log(&self, record: &log::Record<'_>) {
++                if self.enabled(record.metadata()) {
++                    eprintln!("redoxfs {}: {}", record.level(), record.args());
++                }
++            }
++            fn flush(&self) {}
++        }
++        static LOGGER: BootLogger = BootLogger;
++        log::set_logger(&LOGGER).expect("redoxfs logger");
++        log::set_max_level(log::LevelFilter::Info);
++    }
+     unsafe {
+         if libc::setpriority(libc::PRIO_PROCESS, 0, -10) == -1 {
+             log::error!("redoxfs: Failed to set nice value");
+diff --git a/src/mount/redox/resource.rs b/src/mount/redox/resource.rs
+index f1c1239..6b33cfb 100644
+--- a/src/mount/redox/resource.rs
++++ b/src/mount/redox/resource.rs
+@@ -446,19 +446,16 @@ impl FileMmapInfo {
+         self.open_fds > 0 || self.ranges.iter().any(|(_, fmap)| fmap.rc > 0)
+     }
+ 
+-    pub fn stale(&self) -> bool {
+-        // TODO: should this be any?
+-        // TODO: stale by duration/memory pressure
+-        self.ranges
+-            .iter()
+-            .all(|(_, fmap)| fmap.version != self.version)
+-    }
+ }
+ 
+ impl Drop for FileMmapInfo {
+     fn drop(&mut self) {
+         if self.in_use() {
+             log::error!("FileMmapInfo dropped while in use");
++        } else if !self.base.is_null() {
++            if let Err(err) = unsafe { libredox::call::munmap(self.base.cast(), self.size) } {
++                log::error!("failed to release closed node mapping: {}", err);
++            }
+         }
+     }
+ }
+@@ -721,16 +718,11 @@ impl<D: Disk> Resource<D> for FileResource {
+             // Notify filesystem of close
+             tx.on_close_node(self.node_ptr)?;
+ 
+-            // if this fmap version is outdated it's no use
+-            if fmap_info.stale() {
+-                let fmap = fmaps
+-                    .remove(&self.node_ptr.id())
+-                    .expect("fmap_info must exist");
+-
+-                if let Err(e) = unsafe { libredox::call::munmap(fmap.base as *mut _, fmap.size) } {
+-                    log::error!("Munmap error {e}");
+-                }
+-            }
++            // No external mappings or descriptors remain. Keeping the cache
++            // permits stale data to survive reuse of this node ID.
++            fmaps
++                .remove(&self.node_ptr.id())
++                .expect("fmap_info must exist");
+         }
+ 
+         Ok(())
+diff --git a/src/mount/redox/scheme.rs b/src/mount/redox/scheme.rs
+index 9f45d2a..f2ee000 100644
+--- a/src/mount/redox/scheme.rs
++++ b/src/mount/redox/scheme.rs
+@@ -986,10 +986,9 @@ impl<'sock, D: Disk> SchemeSync for FileScheme<'sock, D> {
+                 log::error!("failed to close node {}: {}", node_ptr.id(), err);
+             }
+ 
+-            /*TODO: leaks memory, but why?
+-            // Remove from fmap list
++            // Node IDs can be reused after the last open/mapping is gone. A
++            // retained cache would then serve the previous file's pages.
+             self.fmap.remove(&node_ptr.id());
+-            */
+         }
+     }
+ 

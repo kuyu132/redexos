@@ -1,0 +1,557 @@
+diff --git a/bootstrap/src/procmgr.rs b/bootstrap/src/procmgr.rs
+index dd0118a..8af1652 100644
+--- a/bootstrap/src/procmgr.rs
++++ b/bootstrap/src/procmgr.rs
+@@ -18,7 +18,7 @@ use hashbrown::hash_map::{Entry, OccupiedEntry, VacantEntry};
+ use hashbrown::{DefaultHashBuilder, HashMap};
+ use libredox::protocol::{
+     PidfdCall, ProcCall, ProcKillTarget, ProcMeta, Rlimit, RtSigInfo, SIGCHLD, SIGCONT, SIGHUP,
+-    SIGKILL, SIGSTOP, SIGTSTP, SIGTTIN, SIGTTOU, ThreadCall, WaitFlags,
++    SIGKILL, SIGSTOP, SIGTRAP, SIGTSTP, SIGTTIN, SIGTTOU, ThreadCall, WaitFlags,
+ };
+ use redox_rt::proc::FdGuard;
+ use redox_scheme::scheme::{IntoTag, Op, OpCall};
+@@ -151,6 +151,12 @@ pub fn run(write_fd: FdGuard, socket: Socket, auth: FdGuard, event: FdGuard) ->
+             let mut sts_buf = CtxtStsBuf::default();
+             thread.status_hndl.read(&mut sts_buf).unwrap();
+ 
++            if sts_buf.status == ContextStatus::Stopped as usize && proc.debug_traceme {
++                drop(proc);
++                drop(thread);
++                scheme.on_debug_stop(pid, &mut awoken);
++                continue;
++            }
+             let status = if sts_buf.status == ContextStatus::Dead as usize {
+                 // dont-care, already called explicit exit()
+                 0
+@@ -390,6 +396,8 @@ struct Process {
+ 
+     status: ProcessStatus,
+     disabled_setpgid: bool,
++    debug_traceme: bool,
++    debug_no_new_privs: bool,
+ 
+     awaiting_threads_term: Vec<VirtualId>,
+ 
+@@ -655,6 +663,8 @@ impl<'a> ProcScheme<'a> {
+ 
+                     status: ProcessStatus::PossiblyRunnable,
+                     disabled_setpgid: false,
++                    debug_traceme: false,
++                    debug_no_new_privs: false,
+                     awaiting_threads_term: Vec::new(),
+                     waitpid: BTreeMap::new(),
+                     waitpid_waiting: VecDeque::new(),
+@@ -742,6 +752,7 @@ impl<'a> ProcScheme<'a> {
+             name,
+             prio,
+             rlim,
++            debug_no_new_privs,
+             ..
+         } = *proc_guard.borrow();
+ 
+@@ -780,6 +791,8 @@ impl<'a> ProcScheme<'a> {
+ 
+             status: ProcessStatus::PossiblyRunnable,
+             disabled_setpgid: false,
++            debug_traceme: false,
++            debug_no_new_privs,
+             awaiting_threads_term: Vec::new(),
+ 
+             waitpid: BTreeMap::new(),
+@@ -1005,6 +1018,34 @@ impl<'a> ProcScheme<'a> {
+         log::trace!("Dup request");
+         match self.handles[old_id] {
+             Handle::Proc(pid) => match buf {
++                b"debug-traceme" => {
++                    let mut proc = self.processes.get(&pid).ok_or(Error::new(ESRCH))?.borrow_mut();
++                    proc.debug_traceme = true;
++                    proc.debug_no_new_privs = true;
++                    Ok(OpenResult::ThisScheme { number: self.handles.insert(Handle::Proc(pid)), flags: NewFdFlags::empty() })
++                }
++                request if request.starts_with(b"debug-child:") || request.starts_with(b"debug-check:") => {
++                    let checking = request.starts_with(b"debug-check:");
++                    let number = core::str::from_utf8(&request[12..]).ok()
++                        .and_then(|s| s.parse::<usize>().ok()).ok_or(Error::new(EINVAL))?;
++                    let child_pid = ProcessId(number);
++                    if child_pid == pid { return Err(Error::new(EPERM)); }
++                    let parent = self.processes.get(&pid).ok_or(Error::new(ESRCH))?.borrow();
++                    let mut child = self.processes.get(&child_pid).ok_or(Error::new(ESRCH))?.borrow_mut();
++                    // Process capabilities are granted only for a same-credential direct child.
++                    if child.ppid != pid || child.ruid != parent.euid || child.euid != parent.euid
++                        || child.suid != parent.euid || child.rgid != parent.egid || child.egid != parent.egid
++                        || child.sgid != parent.egid || (checking && !child.debug_traceme) {
++                        return Err(Error::new(EPERM));
++                    }
++                    if checking {
++                        return Ok(OpenResult::ThisScheme { number: self.handles.insert(Handle::ProcObj(child_pid)), flags: NewFdFlags::empty() });
++                    }
++                    if child.threads.len() != 1 { return Err(Error::new(EOPNOTSUPP)); }
++                    child.debug_no_new_privs = true;
++                    child.debug_traceme = true;
++                    Ok(OpenResult::OtherScheme { fd: child.threads[0].borrow().fd.dup(b"open_via_dup")?.take() })
++                }
+                 b"fork" => {
+                     log::trace!("Forking {pid:?}");
+                     let child_pid = self.fork(pid)?;
+@@ -1232,7 +1273,14 @@ impl<'a> ProcScheme<'a> {
+                     )),
+                     ProcCall::DisableSetpgid => {
+                         if let Some(proc) = self.processes.get(&fd_pid) {
+-                            proc.borrow_mut().disabled_setpgid = true;
++                            let mut proc = proc.borrow_mut();
++                            proc.disabled_setpgid = true;
++                            // This is the exec handoff. POSIX exec replaces saved
++                            // credentials with the effective IDs of the new image.
++                            // In particular, a logged-in user must not keep the
++                            // launcher's saved root identity across later execs.
++                            proc.suid = proc.euid;
++                            proc.sgid = proc.egid;
+                             Response::ready_ok(0, op)
+                         } else {
+                             Response::ready_err(ESRCH, op)
+@@ -1615,6 +1663,18 @@ impl<'a> ProcScheme<'a> {
+         proc.pgid = new_pgid;
+         Ok(())
+     }
++    fn on_debug_stop(&mut self, pid: ProcessId, awoken: &mut VecDeque<VirtualId>) {
++        let Some(proc) = self.processes.get(&pid) else { return; };
++        let (ppid, pgid) = { let proc = proc.borrow(); (proc.ppid, proc.pgid) };
++        if let Some(parent) = self.processes.get(&ppid) {
++            let mut parent = parent.borrow_mut();
++            parent.waitpid.insert(WaitpidKey { pid: Some(pid), pgid: Some(pgid) },
++                (pid, WaitpidStatus::Stopped { signal: NonZeroU8::new(SIGTRAP as u8).unwrap() }));
++            awoken.extend(parent.waitpid_waiting.drain(..));
++        }
++        let _ = self.on_send_sig(INIT_PID, KillTarget::Proc(ppid), SIGCHLD as u8,
++            &mut false, KillMode::Idempotent, true, awoken);
++    }
+     fn on_exit_start(
+         &mut self,
+         pid: ProcessId,
+@@ -1706,108 +1766,80 @@ impl<'a> ProcScheme<'a> {
+         flags: WaitFlags,
+         req_id: VirtualId,
+     ) -> Poll<Result<(usize, i32)>> {
+-        if matches!(
+-            target,
+-            WaitpidTarget::AnyChild | WaitpidTarget::AnyGroupMember
+-        ) {
+-            // Check for existence of child.
+-            // TODO(opt): inefficient, keep refcount?
+-            if !self.processes.values().any(|p| p.borrow().ppid == this_pid) {
+-                return Ready(Err(Error::new(ECHILD)));
++        loop {
++            if matches!(
++                target,
++                WaitpidTarget::AnyChild | WaitpidTarget::AnyGroupMember
++            ) {
++                // Check for existence of child.
++                // TODO(opt): inefficient, keep refcount?
++                if !self.processes.values().any(|p| p.borrow().ppid == this_pid) {
++                    return Ready(Err(Error::new(ECHILD)));
++                }
+             }
+-        }
+ 
+-        let proc_rc = self.processes.get(&this_pid).ok_or(Error::new(EBADFD))?;
++            let proc_rc = self.processes.get(&this_pid).ok_or(Error::new(EBADFD))?;
+ 
+-        log::trace!("PROCS {:#?}", self.processes);
++            log::trace!("PROCS {:#?}", self.processes);
+ 
+-        let mut proc_guard = proc_rc.borrow_mut();
+-        let proc = &mut *proc_guard;
++            let mut proc_guard = proc_rc.borrow_mut();
++            let proc = &mut *proc_guard;
+ 
+-        let recv_nonblock = |waitpid: &mut BTreeMap<WaitpidKey, (ProcessId, WaitpidStatus)>,
+-                             key: &WaitpidKey|
+-         -> Option<(ProcessId, WaitpidStatus)> {
+-            if let Some((pid, sts)) = waitpid.get(key).map(|(k, v)| (*k, *v)) {
+-                waitpid.remove(key);
+-                /*while let Some((_, new_sts)) = waitpid.remove(&WaitpidKey { pid: Some(pid), pgid: None }) {
+-                    sts = new_sts;
+-                }*/
+-                Some((pid, sts))
+-            } else {
+-                None
+-            }
+-        };
+-        let grim_reaper =
+-            |w_pid: ProcessId, status: WaitpidStatus, scheme: &mut ProcScheme| match status {
+-                WaitpidStatus::Continued => {
+-                    if flags.contains(WaitFlags::WCONTINUED) {
+-                        Ready((w_pid.0, 0xffff))
+-                    } else {
+-                        Pending
+-                    }
+-                }
+-                WaitpidStatus::Stopped { signal } => {
+-                    if flags.contains(WaitFlags::WUNTRACED) {
+-                        Ready((w_pid.0, 0x7f | (i32::from(signal.get()) << 8)))
+-                    } else {
+-                        Pending
+-                    }
+-                }
+-                WaitpidStatus::Terminated { signal, status } => {
+-                    scheme.reap(w_pid);
+-                    Ready((
+-                        w_pid.0,
+-                        i32::from(signal.map_or(0, NonZeroU8::get)) | (i32::from(status) << 8),
+-                    ))
++            let recv_nonblock = |waitpid: &mut BTreeMap<WaitpidKey, (ProcessId, WaitpidStatus)>,
++                                 key: &WaitpidKey|
++             -> Option<(ProcessId, WaitpidStatus)> {
++                if let Some((pid, sts)) = waitpid.get(key).map(|(k, v)| (*k, *v)) {
++                    waitpid.remove(key);
++                    /*while let Some((_, new_sts)) = waitpid.remove(&WaitpidKey { pid: Some(pid), pgid: None }) {
++                        sts = new_sts;
++                    }*/
++                    Some((pid, sts))
++                } else {
++                    None
+                 }
+             };
++            let mut discarded = false;
++            let mut grim_reaper =
++                |w_pid: ProcessId, status: WaitpidStatus, scheme: &mut ProcScheme| match status {
++                    WaitpidStatus::Continued => {
++                        if flags.contains(WaitFlags::WCONTINUED) {
++                            Ready((w_pid.0, 0xffff))
++                        } else {
++                            discarded = true;
++                            Pending
++                        }
++                    }
++                    WaitpidStatus::Stopped { signal } => {
++                        if flags.contains(WaitFlags::WUNTRACED) {
++                            Ready((w_pid.0, 0x7f | (i32::from(signal.get()) << 8)))
++                        } else {
++                            discarded = true;
++                            Pending
++                        }
++                    }
++                    WaitpidStatus::Terminated { signal, status } => {
++                        scheme.reap(w_pid);
++                        Ready((
++                            w_pid.0,
++                            i32::from(signal.map_or(0, NonZeroU8::get)) | (i32::from(status) << 8),
++                        ))
++                    }
++                };
+ 
+-        match target {
+-            WaitpidTarget::AnyChild | WaitpidTarget::AnyGroupMember => {
+-                let kv = (if matches!(target, WaitpidTarget::AnyChild) {
+-                    proc.waitpid.first_key_value()
+-                } else {
+-                    proc.waitpid.get_key_value(&WaitpidKey {
+-                        pid: None,
+-                        pgid: Some(proc.pgid),
++            let result = match target {
++                WaitpidTarget::AnyChild | WaitpidTarget::AnyGroupMember => {
++                    let kv = (if matches!(target, WaitpidTarget::AnyChild) {
++                        proc.waitpid.first_key_value()
++                    } else {
++                        proc.waitpid.get_key_value(&WaitpidKey {
++                            pid: None,
++                            pgid: Some(proc.pgid),
++                        })
+                     })
+-                })
+-                .map(|(k, v)| (*k, *v));
+-                if let Some((wid, (w_pid, status))) = kv {
+-                    let _ = proc.waitpid.remove(&wid);
+-                    drop(proc_guard);
+-                    grim_reaper(w_pid, status, self).map(Ok)
+-                } else if flags.contains(WaitFlags::WNOHANG) {
+-                    Ready(Ok((0, 0)))
+-                } else {
+-                    proc.waitpid_waiting.push_back(req_id);
+-                    Pending
+-                }
+-            }
+-            WaitpidTarget::SingleProc(pid) => {
+-                if this_pid == pid {
+-                    return Ready(Err(Error::new(EINVAL)));
+-                }
+-                let target_proc_rc = self.processes.get(&pid).ok_or(Error::new(ECHILD))?;
+-                let target_proc = target_proc_rc.borrow_mut();
+-
+-                if target_proc.ppid != this_pid {
+-                    return Ready(Err(Error::new(ECHILD)));
+-                }
+-                let key = WaitpidKey {
+-                    pid: Some(pid),
+-                    pgid: None,
+-                };
+-                if let ProcessStatus::Exited { status, signal } = target_proc.status {
+-                    let _ = recv_nonblock(&mut proc.waitpid, &key);
+-                    drop(proc_guard);
+-                    drop(target_proc);
+-                    grim_reaper(pid, WaitpidStatus::Terminated { signal, status }, self).map(Ok)
+-                } else {
+-                    let res = recv_nonblock(&mut proc.waitpid, &key);
+-                    if let Some((w_pid, status)) = res {
++                    .map(|(k, v)| (*k, *v));
++                    if let Some((wid, (w_pid, status))) = kv {
++                        let _ = proc.waitpid.remove(&wid);
+                         drop(proc_guard);
+-                        drop(target_proc);
+                         grim_reaper(w_pid, status, self).map(Ok)
+                     } else if flags.contains(WaitFlags::WNOHANG) {
+                         Ready(Ok((0, 0)))
+@@ -1816,38 +1848,74 @@ impl<'a> ProcScheme<'a> {
+                         Pending
+                     }
+                 }
+-            }
+-            WaitpidTarget::ProcGroup(pgid) => {
+-                if let Some(group_rc) = self.groups.get(&pgid) {
+-                    let group = group_rc.borrow();
+-                    if !group
+-                        .processes
+-                        .iter()
+-                        .filter_map(Weak::upgrade)
+-                        .filter(|r| !Rc::ptr_eq(r, proc_rc))
+-                        .any(|p| p.borrow().ppid == this_pid)
+-                    {
++                WaitpidTarget::SingleProc(pid) => {
++                    if this_pid == pid {
++                        return Ready(Err(Error::new(EINVAL)));
++                    }
++                    let target_proc_rc = self.processes.get(&pid).ok_or(Error::new(ECHILD))?;
++                    let target_proc = target_proc_rc.borrow_mut();
++
++                    if target_proc.ppid != this_pid {
+                         return Ready(Err(Error::new(ECHILD)));
+                     }
+-                } else {
+-                    return Ready(Err(Error::new(ECHILD)));
++                    let key = WaitpidKey {
++                        pid: Some(pid),
++                        pgid: None,
++                    };
++                    if let ProcessStatus::Exited { status, signal } = target_proc.status {
++                        let _ = recv_nonblock(&mut proc.waitpid, &key);
++                        drop(proc_guard);
++                        drop(target_proc);
++                        grim_reaper(pid, WaitpidStatus::Terminated { signal, status }, self).map(Ok)
++                    } else {
++                        let res = recv_nonblock(&mut proc.waitpid, &key);
++                        if let Some((w_pid, status)) = res {
++                            drop(proc_guard);
++                            drop(target_proc);
++                            grim_reaper(w_pid, status, self).map(Ok)
++                        } else if flags.contains(WaitFlags::WNOHANG) {
++                            Ready(Ok((0, 0)))
++                        } else {
++                            proc.waitpid_waiting.push_back(req_id);
++                            Pending
++                        }
++                    }
+                 }
++                WaitpidTarget::ProcGroup(pgid) => {
++                    if let Some(group_rc) = self.groups.get(&pgid) {
++                        let group = group_rc.borrow();
++                        if !group
++                            .processes
++                            .iter()
++                            .filter_map(Weak::upgrade)
++                            .filter(|r| !Rc::ptr_eq(r, proc_rc))
++                            .any(|p| p.borrow().ppid == this_pid)
++                        {
++                            return Ready(Err(Error::new(ECHILD)));
++                        }
++                    } else {
++                        return Ready(Err(Error::new(ECHILD)));
++                    }
+ 
+-                let key = WaitpidKey {
+-                    pid: None,
+-                    pgid: Some(pgid),
+-                };
+-                if let Some(&(w_pid, status)) = proc.waitpid.get(&key) {
+-                    let _ = proc.waitpid.remove(&key);
+-                    drop(proc_guard);
+-                    grim_reaper(w_pid, status, self).map(Ok)
+-                } else if flags.contains(WaitFlags::WNOHANG) {
+-                    Ready(Ok((0, 0)))
+-                } else {
+-                    proc.waitpid_waiting.push_back(req_id);
+-                    Pending
++                    let key = WaitpidKey {
++                        pid: None,
++                        pgid: Some(pgid),
++                    };
++                    if let Some(&(w_pid, status)) = proc.waitpid.get(&key) {
++                        let _ = proc.waitpid.remove(&key);
++                        drop(proc_guard);
++                        grim_reaper(w_pid, status, self).map(Ok)
++                    } else if flags.contains(WaitFlags::WNOHANG) {
++                        Ready(Ok((0, 0)))
++                    } else {
++                        proc.waitpid_waiting.push_back(req_id);
++                        Pending
++                    }
+                 }
+-            }
++            };
++            // A status excluded by the wait flags has been consumed. Retry before
++            // sleeping so the request is either satisfied or registered as a waiter.
++        if !discarded { return result; }
+         }
+     }
+     fn reap(&mut self, pid: ProcessId) {
+@@ -1896,6 +1964,12 @@ impl<'a> ProcScheme<'a> {
+             .ok_or(Error::new(ESRCH))?
+             .borrow_mut();
+ 
++        if proc.debug_no_new_privs {
++            if [new_ruid, new_euid, new_suid].iter().flatten().any(|id| ![proc.ruid, proc.euid, proc.suid].contains(id))
++                || [new_rgid, new_egid, new_sgid].iter().flatten().any(|id| ![proc.rgid, proc.egid, proc.sgid].contains(id)) {
++                return Err(Error::new(EPERM));
++            }
++        }
+         if proc.euid != 0 {
+             if ![new_ruid, new_euid, new_suid]
+                 .iter()
+diff --git a/drivers/input/usbhidd/src/main.rs b/drivers/input/usbhidd/src/main.rs
+index 7aaf479..fd7e3a3 100644
+--- a/drivers/input/usbhidd/src/main.rs
++++ b/drivers/input/usbhidd/src/main.rs
+@@ -320,9 +320,10 @@ fn main() -> Result<()> {
+ 
+     //TODO: do we need to set protocol to report? It fails for mice.
+ 
+-    //TODO: dynamically create good values, fix xhcid so it does not block on each request
+-    // This sets all reports to a duration of 4ms
+-    if let Err(err) = reqs::set_idle(&handle, 1, 0, interface_num as u16) {
++    // Report state changes; do not generate unchanged reports every 4 ms.
++    // QEMU gives keyboard and pointer separate controllers because xhcid's
++    // current scheme handler serializes blocking endpoint reads.
++    if let Err(err) = reqs::set_idle(&handle, 0, 0, interface_num as u16) {
+         log::warn!("failed to set idle: {}", err);
+     }
+ 
+@@ -425,11 +426,14 @@ fn main() -> Result<()> {
+     let mut last_buttons = [false, false, false];
+     let mut gamepad_state = HashMap::new();
+     loop {
+-        //TODO: get frequency from device
+-        //TODO: use sleeps when accuracy is better: thread::sleep(time::Duration::from_millis(10));
+-        let timer = time::Instant::now();
+-        while timer.elapsed() < time::Duration::from_millis(1) {
+-            thread::yield_now();
++        // Interrupt reads already block until the endpoint has a report.
++        // An extra yield loop delays draining queued key releases under TCG.
++        // Only control-transfer fallback needs software polling throttling.
++        if endpoint_opt.is_none() {
++            let timer = time::Instant::now();
++            while timer.elapsed() < time::Duration::from_millis(1) {
++                thread::yield_now();
++            }
+         }
+ 
+         if let Some(endpoint) = &mut endpoint_opt {
+diff --git a/drivers/storage/ahcid/src/ahci/hba.rs b/drivers/storage/ahcid/src/ahci/hba.rs
+index 84ddaea..ff99a9e 100644
+--- a/drivers/storage/ahcid/src/ahci/hba.rs
++++ b/drivers/storage/ahcid/src/ahci/hba.rs
+@@ -63,19 +63,43 @@ pub struct HbaPort {
+ }
+ 
+ impl HbaPort {
+-    pub fn probe(&self) -> HbaPortType {
+-        if self.ssts.readf(HBA_SSTS_PRESENT) {
+-            let sig = self.sig.read();
+-            match sig {
+-                HBA_SIG_ATA => HbaPortType::SATA,
+-                HBA_SIG_ATAPI => HbaPortType::SATAPI,
+-                HBA_SIG_PM => HbaPortType::PM,
+-                HBA_SIG_SEMB => HbaPortType::SEMB,
+-                _ => HbaPortType::Unknown(sig),
++    pub fn probe(&mut self) -> Result<HbaPortType> {
++        if !self.ssts.readf(HBA_SSTS_PRESENT) {
++            return Ok(HbaPortType::None);
++        }
++        // Firmware may never have touched this controller. PxSIG becomes valid
++        // only after the initial device-to-host FIS has been received.
++        if matches!(self.sig.read(), 0 | u32::MAX) {
++            self.stop()?;
++            let fb: Dma<[u8; 256]> = unsafe { Dma::zeroed()?.assume_init() };
++            self.fb[0].write(fb.physical() as u32);
++            self.fb[1].write((fb.physical() as u64 >> 32) as u32);
++            self.cmd.writef(HBA_PORT_CMD_FRE, true);
++            let timeout = Timeout::new(TIMEOUT);
++            let result = loop {
++                if !matches!(self.sig.read(), 0 | u32::MAX) {
++                    break Ok(());
++                }
++                if timeout.run().is_err() {
++                    break Err(Error::new(EIO));
++                }
++            };
++            if let Err(err) = self.stop() {
++                // DMA may still target this buffer when the controller is stuck.
++                std::mem::forget(fb);
++                return Err(err);
+             }
+-        } else {
+-            HbaPortType::None
++            self.fb[0].write(0);
++            self.fb[1].write(0);
++            result?;
+         }
++        Ok(match self.sig.read() {
++            HBA_SIG_ATA => HbaPortType::SATA,
++            HBA_SIG_ATAPI => HbaPortType::SATAPI,
++            HBA_SIG_PM => HbaPortType::PM,
++            HBA_SIG_SEMB => HbaPortType::SEMB,
++            sig => HbaPortType::Unknown(sig),
++        })
+     }
+ 
+     pub fn start(&mut self) -> Result<()> {
+@@ -95,7 +119,7 @@ impl HbaPort {
+         self.cmd.writef(HBA_PORT_CMD_ST, false);
+ 
+         let timeout = Timeout::new(TIMEOUT);
+-        while self.cmd.readf(HBA_PORT_CMD_FR | HBA_PORT_CMD_CR) {
++        while self.cmd.readf(HBA_PORT_CMD_CR) {
+             timeout.run().map_err(|()| {
+                 log::error!("HBA stop timed out");
+                 Error::new(EIO)
+@@ -103,6 +127,12 @@ impl HbaPort {
+         }
+ 
+         self.cmd.writef(HBA_PORT_CMD_FRE, false);
++        while self.cmd.readf(HBA_PORT_CMD_FR) {
++            timeout.run().map_err(|()| {
++                log::error!("HBA FIS receive stop timed out");
++                Error::new(EIO)
++            })?;
++        }
+         Ok(())
+     }
+ 
+diff --git a/drivers/storage/ahcid/src/ahci/mod.rs b/drivers/storage/ahcid/src/ahci/mod.rs
+index 4d8cc8c..93a25d8 100644
+--- a/drivers/storage/ahcid/src/ahci/mod.rs
++++ b/drivers/storage/ahcid/src/ahci/mod.rs
+@@ -50,7 +50,13 @@ pub fn disks(base: usize, name: &str) -> (&'static mut HbaMem, Vec<AnyDisk>) {
+         .filter(|&i| pi & 1 << i as i32 == 1 << i as i32)
+         .filter_map(|i| {
+             let port = unsafe { &mut *hba_mem.ports.as_mut_ptr().add(i) };
+-            let port_type = port.probe();
++            let port_type = match port.probe() {
++                Ok(kind) => kind,
++                Err(err) => {
++                    error!("{}-{}: signature probe failed: {}", name, i, err);
++                    return None;
++                }
++            };
+             info!("{}-{}: {:?}", name, i, port_type);
+ 
+             let disk: Option<AnyDisk> = match port_type {

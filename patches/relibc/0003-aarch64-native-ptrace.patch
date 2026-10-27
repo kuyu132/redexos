@@ -1,0 +1,668 @@
+diff --git a/redox-rt/src/arch/aarch64.rs b/redox-rt/src/arch/aarch64.rs
+index c10a304..a9a1e02 100644
+--- a/redox-rt/src/arch/aarch64.rs
++++ b/redox-rt/src/arch/aarch64.rs
+@@ -333,7 +333,8 @@ asmfunction!(__relibc_internal_sigentry: ["
+     stp x2, x3, [sp, #-16]!
+ 
+     ldp x2, x3, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
+-    stp x2, x3, [sp, #-16]!
++    // x2 holds saved x1 and x3 holds saved x2. Match the x2,x1 pop below.
++    stp x3, x2, [sp, #-16]!
+     ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
+     stp x4, x3, [sp, #-16]!
+     ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
+@@ -360,34 +361,10 @@ asmfunction!(__relibc_internal_sigentry: ["
+     bl {inner}
+ 
+     add sp, sp, #64
+-
+-    ldp x30, x29, [sp], #16
+-    ldp x28, x27, [sp], #16
+-    ldp x26, x25, [sp], #16
+-    ldp x24, x23, [sp], #16
+-    ldp x22, x21, [sp], #16
+-    ldp x20, x19, [sp], #16
+-    ldp x18, x17, [sp], #16
+-    ldp x16, x15, [sp], #16
+-    ldp x14, x13, [sp], #16
+-    ldp x12, x11, [sp], #16
+-    ldp x10, x9, [sp], #16
+-    ldp x8, x7, [sp], #16
+-    ldp x6, x5, [sp], #16
+-    ldp x4, x3, [sp], #16
+-    ldp x2, x1, [sp], #16
+-
+-    ldr x0, [sp, #8]
+-    msr nzcv, x0
+-
+-8:
+-    // x18 is reserved by ABI as 'platform register', so clobbering it should be safe.
+-    mov x18, sp
+-    ldr x0, [x18]
+-    mov sp, x0
+-
+-    ldp x18, x0, [x18, #16]
+-    br x18
++    mov x0, sp
++    mov x8, #{SIGRETURN}
++    svc 0
++    udf #0
+ 7:
+     // Spurious signal, i.e. all bitsets were 0 at the time they were checked
+     clrex
+@@ -396,12 +373,42 @@ asmfunction!(__relibc_internal_sigentry: ["
+     and x1, x1, ~1
+     str x1, [x0, #{tcb_sc_off} + {sc_flags}]
+ 
+-    ldp x1, x2, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
++    // Form the same ArchIntRegs frame as the normal signal path so the
++    // kernel can atomically restore every register, including x18.
++    mov x4, sp
++    sub x4, x4, {REDZONE_SIZE}
++    and x4, x4, -{STACK_ALIGN}
++    mov sp, x4
++
++    ldr x2, [x0, #{tcb_sc_off} + {sc_saved_pc}]
++    ldr x3, [x0, #{tcb_sc_off} + {sc_saved_x0}]
++    stp x2, x3, [sp, #-16]!
++    ldr x2, [x0, #{tcb_sa_off} + {sa_tmp_sp}]
++    mrs x3, nzcv
++    stp x2, x3, [sp, #-16]!
++    ldp x2, x3, [x0, #{tcb_sa_off} + {sa_tmp_x1_x2}]
++    stp x3, x2, [sp, #-16]!
+     ldp x3, x4, [x0, #{tcb_sa_off} + {sa_tmp_x3_x4}]
++    stp x4, x3, [sp, #-16]!
+     ldp x5, x6, [x0, #{tcb_sa_off} + {sa_tmp_x5_x6}]
+-    ldr x18, [x0, #{tcb_sc_off} + {sc_saved_pc}]
+-    ldr x0, [x0, #{tcb_sc_off} + {sc_saved_x0}]
+-    br x18
++    stp x6, x5, [sp, #-16]!
++    ldp x7, x8, [x0, #{tcb_sa_off} + {sa_tmp_x7_x8}]
++    stp x8, x7, [sp, #-16]!
++    stp x10, x9, [sp, #-16]!
++    stp x12, x11, [sp, #-16]!
++    stp x14, x13, [sp, #-16]!
++    stp x16, x15, [sp, #-16]!
++    stp x18, x17, [sp, #-16]!
++    stp x20, x19, [sp, #-16]!
++    stp x22, x21, [sp, #-16]!
++    stp x24, x23, [sp, #-16]!
++    stp x26, x25, [sp, #-16]!
++    stp x28, x27, [sp, #-16]!
++    stp x30, x29, [sp, #-16]!
++    mov x0, sp
++    mov x8, #{SIGRETURN}
++    svc 0
++    udf #0
+ "] <= [
+     pctl_pending = const (offset_of!(SigProcControl, pending)),
+     pctl_actions = const (offset_of!(SigProcControl, actions)),
+@@ -428,6 +435,7 @@ asmfunction!(__relibc_internal_sigentry: ["
+     SA_ONSTACK_BIT = const 58, // (1 << 58) >> 32 = 0x0400_0000
+ 
+     SYS_CALL = const syscall::SYS_CALL,
++    SIGRETURN = const 139,
+ 
+     STACK_ALIGN = const 16,
+     REDZONE_SIZE = const 128,
+diff --git a/src/header/stdio/mod.rs b/src/header/stdio/mod.rs
+index 05ff3aa..51793c9 100644
+--- a/src/header/stdio/mod.rs
++++ b/src/header/stdio/mod.rs
+@@ -63,7 +63,8 @@ enum Buffer<'a> {
+     /// Owned and maybe initialized
+     Owned(Option<Vec<u8>>),
+     /// Specifically disable buffering
+-    Unbuffered,
++    // A one-byte input buffer implements unbuffered reads without prefetch.
++    Unbuffered([u8; 1]),
+ }
+ 
+ impl Buffer<'_> {
+@@ -85,6 +86,7 @@ impl<'a> Deref for Buffer<'a> {
+         match self {
+             Buffer::Borrowed(inner) => inner,
+             Buffer::Owned(Some(inner)) => inner.borrow(),
++            Buffer::Unbuffered(byte) => byte,
+             _ => &[],
+         }
+     }
+@@ -95,6 +97,7 @@ impl<'a> DerefMut for Buffer<'a> {
+         match self {
+             Buffer::Borrowed(inner) => inner,
+             Buffer::Owned(Some(inner)) => inner.borrow_mut(),
++            Buffer::Unbuffered(byte) => byte,
+             _ => &mut [],
+         }
+     }
+@@ -1380,7 +1383,7 @@ pub unsafe extern "C" fn setvbuf(
+             Buffer::Borrowed(unsafe { slice::from_raw_parts_mut(buf.cast::<u8>(), size) })
+         }
+     } else {
+-        Buffer::Unbuffered
++        Buffer::Unbuffered([0])
+     };
+ 
+     // SAFETY: We take out stream.writer then immediately set again
+diff --git a/src/header/sys_ptrace/cbindgen.toml b/src/header/sys_ptrace/cbindgen.toml
+index 7126c59..a1b1a94 100644
+--- a/src/header/sys_ptrace/cbindgen.toml
++++ b/src/header/sys_ptrace/cbindgen.toml
+@@ -1,6 +1,7 @@
+ # Non-POSIX, see https://www.man7.org/linux/man-pages/man2/ptrace.2.html
+ include_guard = "_RELIBC_SYS_PTRACE_H"
+ language = "C"
++cpp_compat = true
+ 
+ [enum]
+ prefix_with_name = true
+diff --git a/src/header/sys_ptrace/mod.rs b/src/header/sys_ptrace/mod.rs
+index 3f20089..287da6a 100644
+--- a/src/header/sys_ptrace/mod.rs
++++ b/src/header/sys_ptrace/mod.rs
+@@ -4,7 +4,7 @@
+ 
+ use crate::{
+     error::ResultExt,
+-    platform::{PalPtrace, Sys, types::c_int},
++    platform::{PalPtrace, Sys, types::{c_int, c_long}},
+ };
+ 
+ /// Indicate that this process is to be traced by its parent.
+@@ -64,9 +64,9 @@ pub const PTRACE_SYSEMU_SINGLESTEP: c_int = 32;
+ /// - *addr
+ /// - *data
+ ///
+-/// Currently only implemented on x86_64.
++/// Implemented by the platform ptrace compatibility layer.
+ #[unsafe(no_mangle)]
+-pub unsafe extern "C" fn ptrace(request: c_int, mut __valist: ...) -> c_int {
++pub unsafe extern "C" fn ptrace(request: c_int, mut __valist: ...) -> c_long {
+     // Musl also just grabs the arguments from the varargs...
+     unsafe {
+         Sys::ptrace(
+diff --git a/src/ld_so/dso.rs b/src/ld_so/dso.rs
+index 1329495..93654af 100644
+--- a/src/ld_so/dso.rs
++++ b/src/ld_so/dso.rs
+@@ -411,7 +411,7 @@ impl DSO {
+                     ptr: unsafe { base.byte_add(ph.p_vaddr(NativeEndian) as usize) },
+                     image_size: ph.p_filesz(NativeEndian) as usize,
+                     segment_size: memsz,
+-                    offset: (tls_offset + memsz).next_multiple_of(align),
++                    offset: Master::placement(tls_offset, memsz, align),
+                 }
+             })
+             .unwrap();
+@@ -774,7 +774,7 @@ impl DSO {
+                         ptr,
+                         image_size: ph.p_filesz(endian) as usize,
+                         segment_size: memsz,
+-                        offset: (tls_offset + memsz).next_multiple_of(align),
++                        offset: Master::placement(tls_offset, memsz, align),
+                     });
+                     log::trace!("  tcb master {:x?}", tcb_master);
+                 }
+@@ -1152,7 +1152,9 @@ impl DSO {
+             })) as usize;
+         } else {
+             *resolver = __tlsdesc_static as *const () as usize;
+-            *descriptor = sym + tls_offset + reloc.addend.unwrap_or_default();
++            // TP points 16 bytes before the start of AArch64 TLS storage.
++            let abi_offset = if cfg!(target_arch = "aarch64") { 16 } else { 0 };
++            *descriptor = sym + tls_offset + abi_offset + reloc.addend.unwrap_or_default();
+         }
+     }
+ 
+@@ -1243,7 +1245,9 @@ impl DSO {
+                     0
+                 };
+ 
+-                set_usize(if reloc.kind == RelocationKind::TPOFF {
++                set_usize(if cfg!(target_arch = "aarch64") {
++                    tls_obj.tls_offset + 16 + a + b
++                } else if reloc.kind == RelocationKind::TPOFF {
+                     (a + b).wrapping_sub(tls_obj.tls_offset)
+                 } else {
+                     tls_obj.tls_offset.wrapping_sub(a + b)
+diff --git a/src/ld_so/linker.rs b/src/ld_so/linker.rs
+index 06cd439..daaf214 100644
+--- a/src/ld_so/linker.rs
++++ b/src/ld_so/linker.rs
+@@ -843,7 +843,7 @@ impl Linker {
+                 );
+             }
+ 
+-            self.tls_size = master.offset;
++            self.tls_size = master.allocation_end();
+             self.next_tls_module_id += 1;
+             self.next_object_id += 1;
+ 
+@@ -904,7 +904,7 @@ impl Linker {
+ 
+         if let Some(master) = tcb_master {
+             if !dlopened {
+-                self.tls_size = master.offset; // => aligned ph.p_memsz
++                self.tls_size = master.allocation_end();
+             }
+ 
+             tcb_masters.push(master);
+diff --git a/src/ld_so/tcb.rs b/src/ld_so/tcb.rs
+index c64a803..bc09379 100644
+--- a/src/ld_so/tcb.rs
++++ b/src/ld_so/tcb.rs
+@@ -31,6 +31,24 @@ pub struct Master {
+ }
+ 
+ impl Master {
++    /// AArch64 TLS grows upwards after the 16-byte thread-pointer ABI header.
++    /// x86 offsets instead describe the end of a block below the thread pointer.
++    pub fn placement(previous_end: usize, size: usize, align: usize) -> usize {
++        if cfg!(target_arch = "aarch64") {
++            (previous_end + 16).next_multiple_of(align) - 16
++        } else {
++            (previous_end + size).next_multiple_of(align)
++        }
++    }
++
++    pub fn allocation_end(&self) -> usize {
++        if cfg!(target_arch = "aarch64") {
++            self.offset + self.segment_size
++        } else {
++            self.offset
++        }
++    }
++
+     /// The initial data for this TLS region
+     pub unsafe fn data(&self) -> &'static [u8] {
+         unsafe { slice::from_raw_parts(self.ptr, self.image_size) }
+@@ -79,7 +97,12 @@ impl Tcb {
+     #[expect(unsafe_op_in_unsafe_fn)]
+     pub unsafe fn new(size: usize) -> Result<&'static mut Self, DlError> {
+         let page_size = Sys::getpagesize();
+-        let (_abi_page, tls, tcb_page) = Self::os_new(size.next_multiple_of(page_size))?;
++        // AArch64 TP must be aligned too: place the ABI header at the start
++        // of the TLS mapping, not 16 bytes before its page boundary.
++        let abi_header = if cfg!(target_arch = "aarch64") { 16 } else { 0 };
++        let (_abi_page, tls, tcb_page) =
++            Self::os_new((size + abi_header).next_multiple_of(page_size))?;
++        let tls = &mut tls[abi_header..];
+ 
+         let tcb_ptr = tcb_page.as_mut_ptr().cast::<Self>();
+         ptr::write(
+@@ -152,19 +175,14 @@ impl Tcb {
+         if let Some(tls) = unsafe { self.tls() }
+             && let Some(masters) = self.masters()
+         {
+-            for (i, master) in masters.iter().skip(self.num_copied_masters).enumerate() {
++            for master in masters.iter().skip(self.num_copied_masters) {
+                 if master.image_size == 0 {
+                     continue;
+                 }
+ 
+-                let master_idx = self.num_copied_masters + i;
+                 let range = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+                     // x86{_64} TLS layout is backwards
+                     self.tls_len - master.offset..self.tls_len - master.offset + master.image_size
+-                } else if cfg!(target_arch = "aarch64") {
+-                    // AArch64 p_vaddr is ignored for first master, this is experimentally determined
+-                    let start = if master_idx == 0 { 0 } else { master.offset };
+-                    start..start + master.image_size
+                 } else {
+                     master.offset..master.offset + master.image_size
+                 };
+@@ -233,9 +251,6 @@ impl Tcb {
+                     let offset = if cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
+                         // x86{_64} TLS layout is backwards
+                         self.tls_len - master.offset
+-                    } else if cfg!(target_arch = "aarch64") {
+-                        // AArch64 p_vaddr is ignored for first master
+-                        if i == 0 { 0 } else { master.offset }
+                     } else {
+                         master.offset
+                     };
+@@ -313,7 +328,8 @@ impl Tcb {
+     /// +---------------------+
+     ///                     ^
+     ///                     |
+-    ///                     +-------> (page_size - 16): pointer to the start of the TCB page
++    /// The AArch64 header now occupies the first 16 bytes of the TLS mapping;
++    /// TP is page aligned and points to the stored TCB pointer there.
+     /// ```
+     ///
+     /// ABI page layout for riscv64:
+diff --git a/src/platform/linux/ptrace.rs b/src/platform/linux/ptrace.rs
+index 6091dcd..ed34464 100644
+--- a/src/platform/linux/ptrace.rs
++++ b/src/platform/linux/ptrace.rs
+@@ -1,7 +1,7 @@
+ use super::{
+     super::{
+         PalPtrace,
+-        types::{c_int, c_void, pid_t},
++        types::{c_int, c_long, c_void, pid_t},
+     },
+     Sys, e_raw,
+ };
+@@ -13,7 +13,7 @@ impl PalPtrace for Sys {
+         pid: pid_t,
+         addr: *mut c_void,
+         data: *mut c_void,
+-    ) -> Result<c_int> {
+-        Ok(unsafe { e_raw(syscall!(PTRACE, request, pid, addr, data))? as c_int })
++    ) -> Result<c_long> {
++        Ok(unsafe { e_raw(syscall!(PTRACE, request, pid, addr, data))? as c_long })
+     }
+ }
+diff --git a/src/platform/pal/ptrace.rs b/src/platform/pal/ptrace.rs
+index bfe7f5d..a7686b4 100644
+--- a/src/platform/pal/ptrace.rs
++++ b/src/platform/pal/ptrace.rs
+@@ -2,7 +2,7 @@ use crate::{
+     error::Result,
+     platform::{
+         Pal,
+-        types::{c_int, c_void, pid_t},
++        types::{c_int, c_long, c_void, pid_t},
+     },
+ };
+ 
+@@ -14,5 +14,5 @@ pub trait PalPtrace: Pal {
+         pid: pid_t,
+         addr: *mut c_void,
+         data: *mut c_void,
+-    ) -> Result<c_int>;
++    ) -> Result<c_long>;
+ }
+diff --git a/src/platform/redox/mod.rs b/src/platform/redox/mod.rs
+index 8962310..e534544 100644
+--- a/src/platform/redox/mod.rs
++++ b/src/platform/redox/mod.rs
+@@ -1841,13 +1841,17 @@ impl Pal for Sys {
+                 // TODO: Also handle special PIDs here
+                 if !wifstopped(status)
+                     || options.contains(WaitFlags::WUNTRACED)
+-                    || ptrace::is_traceme(pid)
++                    || ptrace::is_traceme(res.as_ref().map_or(pid, |&p| p as pid_t))
++                    || { #[cfg(target_arch = "aarch64")] { ptrace::has_session(res.as_ref().map_or(pid, |&p| p as pid_t)) }
++                         #[cfg(not(target_arch = "aarch64"))] { false } }
+                 {
+                     break res;
+                 }
+             }
+         });
+ 
++        #[cfg(target_arch = "aarch64")]
++        if let Ok(waited) = res { if waited != 0 { ptrace::record_wait(waited as pid_t, status as c_int); } }
+         // If stat_loc is non-null, set that and the return
+         if let Some(mut stat_loc) = stat_loc {
+             stat_loc.write(status as c_int);
+diff --git a/src/platform/redox/ptrace.rs b/src/platform/redox/ptrace.rs
+index f70c00f..7af72b3 100644
+--- a/src/platform/redox/ptrace.rs
++++ b/src/platform/redox/ptrace.rs
+@@ -4,20 +4,19 @@
+ //! we are NOT going to bend our API for the sake of
+ //! compatibility. So, this module will be a hellhole.
+ 
+-use super::super::{ERRNO, PalPtrace, Sys, types::*};
++use super::super::{PalPtrace, Sys, types::*};
++#[cfg(not(target_arch = "aarch64"))]
++use super::super::ERRNO;
+ #[cfg(target_arch = "x86_64")]
+ use super::super::{Pal, PalSignal};
+ #[cfg(target_arch = "x86_64")]
+ use crate::header::arch_x64_user::user_regs_struct;
+ use crate::{
+-    c_str::{CStr, CString},
+     error::Errno,
+     fs::File,
+     header::{
+-        errno::{self as errnoh, EIO},
+-        fcntl,
++        errno::EIO,
+     },
+-    io,
+     raw_cell::RawCell,
+     sync::Mutex,
+ };
+@@ -27,12 +26,17 @@ use crate::{
+     io::prelude::*,
+ };
+ 
+-use alloc::collections::{BTreeMap, btree_map::Entry};
++use alloc::collections::BTreeMap;
++#[cfg(not(target_arch = "aarch64"))]
++use alloc::collections::btree_map::Entry;
++#[cfg(not(target_arch = "aarch64"))]
++use crate::{c_str::{CStr, CString}, header::{fcntl, errno as errnoh}, io};
+ #[cfg(target_arch = "x86_64")]
+ use core::mem;
+ #[cfg(target_arch = "x86_64")]
+ use syscall;
+ 
++#[cfg(not(target_arch = "aarch64"))]
+ pub struct Session {
+     pub first: bool,
+     pub fpregs: File,
+@@ -40,6 +44,13 @@ pub struct Session {
+     pub regs: File,
+     pub tracer: File,
+ }
++#[cfg(target_arch = "aarch64")]
++pub struct Session {
++    pub first: bool,
++    pub thread: File,
++    pub regs: File,
++    pub tracer: File,
++}
+ pub struct State {
+     pub sessions: Mutex<BTreeMap<pid_t, Session>>,
+ }
+@@ -64,6 +75,7 @@ pub fn init_state() -> &'static State {
+         &*state_ptr
+     }
+ }
++#[cfg(not(target_arch = "aarch64"))]
+ pub fn is_traceme(pid: pid_t) -> bool {
+     // Skip special PIDs (<=0)
+     if pid <= 0 {
+@@ -75,6 +87,7 @@ pub fn is_traceme(pid: pid_t) -> bool {
+     )
+     .is_ok()
+ }
++#[cfg(not(target_arch = "aarch64"))]
+ pub fn get_session(
+     sessions: &mut BTreeMap<pid_t, Session>,
+     pid: pid_t,
+@@ -117,16 +130,11 @@ pub fn get_session(
+ }
+ 
+ #[cfg(target_arch = "aarch64")]
+-#[expect(unused_variables, reason = "function not yet implemented")]
+-unsafe fn inner_ptrace(
+-    request: c_int,
+-    pid: pid_t,
+-    addr: *mut c_void,
+-    data: *mut c_void,
+-) -> io::Result<c_int> {
+-    //TODO: aarch64
+-    unimplemented!("inner_ptrace not implemented on aarch64");
+-}
++mod arm64;
++#[cfg(target_arch = "aarch64")]
++pub use arm64::{is_traceme, has_session, record_wait};
++#[cfg(target_arch = "aarch64")]
++use arm64::inner_ptrace;
+ 
+ #[cfg(target_arch = "x86")]
+ #[expect(unused_variables, reason = "function not yet implemented")]
+@@ -286,8 +294,9 @@ impl PalPtrace for Sys {
+         pid: pid_t,
+         addr: *mut c_void,
+         data: *mut c_void,
+-    ) -> Result<c_int, Errno> {
++    ) -> Result<c_long, Errno> {
+         unsafe { inner_ptrace(request, pid, addr, data) }
++            .map(|value| value as c_long)
+             .map_err(|err| Errno(err.raw_os_error().unwrap_or(EIO)))
+     }
+ }
+diff --git a/src/platform/redox/ptrace/arm64.rs b/src/platform/redox/ptrace/arm64.rs
+new file mode 100644
+index 0000000..6e76c23
+--- /dev/null
++++ b/src/platform/redox/ptrace/arm64.rs
+@@ -0,0 +1,151 @@
++//! ARM64 POSIX ptrace over process-manager child capabilities and kernel trace FDs.
++use super::{Session, init_state};
++use crate::{fs::File, header::{errno::*, fcntl, signal, sys_ptrace::*}, io::{self, Read, Write}, platform::{Pal, PalSignal, Sys, types::*}};
++use alloc::collections::{BTreeMap, btree_map::Entry};
++use core::{mem, ptr, slice};
++
++fn io_error(error: syscall::Error) -> io::Error { io::Error::from_raw_os_error(error.errno) }
++fn duplicate(fd: usize, request: &[u8]) -> io::Result<File> {
++    let fd = redox_rt::sys::dup(fd, request).map_err(io_error)?;
++    let fd = c_int::try_from(fd).map_err(|_| io::Error::from_raw_os_error(EMFILE))?;
++    let file = File::new(fd);
++    Sys::fcntl(fd, fcntl::F_SETFD, fcntl::FD_CLOEXEC as _)?;
++    Ok(file)
++}
++
++pub fn is_traceme(pid: pid_t) -> bool {
++    pid > 0 && duplicate(redox_rt::current_proc_fd().as_raw_fd(), format!("debug-check:{pid}").as_bytes()).is_ok()
++}
++
++pub fn get_session(sessions: &mut BTreeMap<pid_t, Session>, pid: pid_t) -> io::Result<&mut Session> {
++    if pid <= 0 { return Err(io::Error::from_raw_os_error(ESRCH)); }
++    match sessions.entry(pid) {
++        Entry::Occupied(entry) => Ok(entry.into_mut()),
++        Entry::Vacant(entry) => {
++            let thread = duplicate(redox_rt::current_proc_fd().as_raw_fd(), format!("debug-child:{pid}").as_bytes())?;
++            let regs = duplicate(thread.fd as usize, b"regs/debug")?;
++            let tracer = duplicate(thread.fd as usize, b"trace")?;
++            Ok(entry.insert(Session { first: true, thread, regs, tracer }))
++        }
++    }
++}
++
++pub fn has_session(pid: pid_t) -> bool { init_state().sessions.lock().contains_key(&pid) }
++
++pub fn record_wait(pid: pid_t, status: c_int) {
++    let mut sessions = init_state().sessions.lock();
++    if status & 0xff != 0x7f && status != 0xffff {
++        sessions.remove(&pid);
++    } else if status & 0xff == 0x7f && (status >> 8) & 0xff == signal::SIGTRAP as c_int {
++        if let Some(session) = sessions.get(&pid) {
++            // The stop is committed by procmgr only after this event was enqueued.
++            let mut event = syscall::PtraceEvent::default();
++            let bytes = unsafe { slice::from_raw_parts_mut((&mut event as *mut syscall::PtraceEvent).cast::<u8>(), mem::size_of_val(&event)) };
++            let _ = (&session.tracer).read(bytes);
++        }
++    }
++}
++
++fn memory_word(session: &Session, address: usize, replacement: Option<usize>) -> io::Result<c_long> {
++    let space = duplicate(session.thread.fd as usize, b"addrspace")?;
++    let mut result = [0_u8; mem::size_of::<usize>()];
++    let input = replacement.map(usize::to_ne_bytes);
++    let mut copied = 0;
++    while copied < result.len() {
++        let address = address.checked_add(copied).ok_or_else(|| io::Error::from_raw_os_error(EFAULT))?;
++        let page = address & !(syscall::PAGE_SIZE - 1);
++        let displacement = address - page;
++        let count = (result.len() - copied).min(syscall::PAGE_SIZE - displacement);
++        let mut original = syscall::MapFlags::PROT_READ;
++        if input.is_some() {
++            let mut found = false;
++            let mut offset = 0;
++            loop {
++                let mut grants = [syscall::GrantDesc::default(); 32];
++                let bytes = unsafe { slice::from_raw_parts_mut(grants.as_mut_ptr().cast::<u8>(), mem::size_of_val(&grants)) };
++                let size = Sys::pread(space.fd, bytes, offset)?;
++                if size == 0 { break; }
++                for grant in &grants[..size / mem::size_of::<syscall::GrantDesc>()] {
++                    if page >= grant.base && page - grant.base < grant.size {
++                        if grant.flags.contains(syscall::GrantFlags::GRANT_WRITE) { original |= syscall::MapFlags::PROT_WRITE; }
++                        if grant.flags.contains(syscall::GrantFlags::GRANT_EXEC) { original |= syscall::MapFlags::PROT_EXEC; }
++                        found = true; break;
++                    }
++                }
++                if found { break; }
++                offset += size as off_t;
++            }
++            if !found { return Err(io::Error::from_raw_os_error(EFAULT)); }
++            let operation = [syscall::ADDRSPACE_OP_MPROTECT, page, syscall::PAGE_SIZE, (original | syscall::MapFlags::PROT_WRITE).bits()];
++            let bytes = unsafe { slice::from_raw_parts(operation.as_ptr().cast::<u8>(), mem::size_of_val(&operation)) };
++            (&space).write_all(bytes)?;
++        }
++        let transfer = (|| -> io::Result<()> {
++            let flags = syscall::MapFlags::PROT_READ | syscall::MapFlags::MAP_SHARED |
++                if input.is_some() { syscall::MapFlags::PROT_WRITE } else { syscall::MapFlags::empty() };
++            let mapping = unsafe { syscall::fmap(space.fd as usize, &syscall::Map { offset: page, size: syscall::PAGE_SIZE, address: 0, flags }) }.map_err(io_error)?;
++            unsafe {
++                if let Some(input) = &input {
++                    ptr::copy_nonoverlapping(input.as_ptr().add(copied), (mapping as *mut u8).add(displacement), count);
++                } else {
++                    ptr::copy_nonoverlapping((mapping as *const u8).add(displacement), result.as_mut_ptr().add(copied), count);
++                }
++                syscall::funmap(mapping, syscall::PAGE_SIZE).map_err(io_error)?;
++            }
++            Ok(())
++        })();
++        if input.is_some() {
++            let operation = [syscall::ADDRSPACE_OP_MPROTECT, page, syscall::PAGE_SIZE, original.bits()];
++            let bytes = unsafe { slice::from_raw_parts(operation.as_ptr().cast::<u8>(), mem::size_of_val(&operation)) };
++            (&space).write_all(bytes)?;
++        }
++        transfer?;
++        copied += count;
++    }
++    Ok(usize::from_ne_bytes(result) as c_long)
++}
++
++pub unsafe fn inner_ptrace(request: c_int, pid: pid_t, address: *mut c_void, data: *mut c_void) -> io::Result<c_long> {
++    if request == PTRACE_TRACEME {
++        duplicate(redox_rt::current_proc_fd().as_raw_fd(), b"debug-traceme")?;
++        return Ok(0);
++    }
++    let state = init_state();
++    let mut sessions = state.sessions.lock();
++    if request == PTRACE_DETACH || request == PTRACE_KILL {
++        let session = sessions.remove(&pid).ok_or_else(|| io::Error::from_raw_os_error(ESRCH))?;
++        drop(session);
++        Sys::kill(pid, if request == PTRACE_KILL { signal::SIGKILL } else { signal::SIGCONT } as _)?;
++        return Ok(0);
++    }
++    if !matches!(request, PTRACE_ATTACH | PTRACE_CONT | PTRACE_SINGLESTEP | PTRACE_GETREGS | PTRACE_SETREGS | PTRACE_PEEKTEXT | PTRACE_PEEKDATA | PTRACE_POKETEXT | PTRACE_POKEDATA) {
++        return Err(io::Error::from_raw_os_error(EOPNOTSUPP));
++    }
++    let session = get_session(&mut sessions, pid)?;
++    match request {
++        PTRACE_ATTACH => Ok(0),
++        PTRACE_CONT | PTRACE_SINGLESTEP => {
++            let mut flags = syscall::PTRACE_STOP_BREAKPOINT | syscall::PTRACE_EVENT_ADDRSPACE_SWITCH | syscall::PTRACE_STOP_EXIT;
++            if request == PTRACE_SINGLESTEP { flags |= syscall::PTRACE_STOP_SINGLESTEP; }
++            (&session.tracer).write_all(&flags.bits().to_ne_bytes())?;
++            if session.first { Sys::kill(pid, signal::SIGCONT as _)?; session.first = false; }
++            if data as usize != 0 { Sys::kill(pid, data as c_int)?; }
++            Ok(0)
++        }
++        PTRACE_GETREGS | PTRACE_SETREGS => {
++            if data.is_null() { return Err(io::Error::from_raw_os_error(EFAULT)); }
++            let size = mem::size_of::<crate::header::arch_aarch64_user::user_regs_struct>();
++            if request == PTRACE_GETREGS {
++                let output = unsafe { slice::from_raw_parts_mut(data.cast::<u8>(), size) };
++                (&session.regs).read_exact(output)?;
++            } else {
++                let input = unsafe { slice::from_raw_parts(data.cast::<u8>(), size) };
++                (&session.regs).write_all(input)?;
++            }
++            Ok(0)
++        }
++        PTRACE_PEEKTEXT | PTRACE_PEEKDATA => memory_word(session, address as usize, None),
++        PTRACE_POKETEXT | PTRACE_POKEDATA => { memory_word(session, address as usize, Some(data as usize))?; Ok(0) }
++        _ => unreachable!(),
++    }
++}

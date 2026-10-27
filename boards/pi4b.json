@@ -1,0 +1,14 @@
+{
+  "name": "Raspberry Pi 4 Model B",
+  "soc": "BCM2711",
+  "arch": "aarch64",
+  "compatible": "raspberrypi,4-model-b",
+  "console": "PL011 on GPIO14/15 after firmware pinmux and console selection",
+  "interrupt_controller": "GICv2",
+  "storage": "BCM2711 eMMC2: runtime driver to be validated",
+  "network": "GENET",
+  "boot_candidate": "Raspberry Pi firmware -> U-Boot rpi_4_defconfig -> AArch64 UEFI Redox live loader",
+  "firmware_revision": null,
+  "handoff_dtb_sha256": null,
+  "hardware_status": "not-tested"
+}

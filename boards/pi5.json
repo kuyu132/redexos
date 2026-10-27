@@ -1,0 +1,14 @@
+{
+  "name": "Raspberry Pi 5",
+  "soc": "BCM2712",
+  "arch": "aarch64",
+  "compatible": "raspberrypi,5-model-b",
+  "console": "BCM2712 PL011 UART10 on dedicated debug connector",
+  "interrupt_controller": "GICv2; peripheral interrupt routes require separate validation",
+  "storage": "BCM2712 SDHCI, independent of RP1",
+  "network": "RP1 Cadence GEM, requires PCIe/MMIO/interrupt/DMA support",
+  "boot_candidate": "Board-specific firmware -> verified UEFI implementation with DTB -> Redox live loader",
+  "firmware_revision": null,
+  "handoff_dtb_sha256": null,
+  "hardware_status": "not-tested"
+}
